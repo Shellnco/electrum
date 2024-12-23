@@ -829,9 +829,12 @@ class LNWallet(LNWorker):
         self.db = wallet.db
         self.node_keypair = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.NODE_KEY)
         self.backup_key = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.BACKUP_CIPHER).privkey
+        self.static_payment_key = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.PAYMENT_BASE)
         self.payment_secret_key = generate_keypair(BIP32Node.from_xkey(xprv), LnKeyFamily.PAYMENT_SECRET_KEY).privkey
         Logger.__init__(self)
         features = LNWALLET_FEATURES
+        if self.config.ENABLE_ANCHOR_CHANNELS:
+            features |= LnFeatures.OPTION_ANCHORS_ZERO_FEE_HTLC_OPT
         if self.config.ACCEPT_ZEROCONF_CHANNELS:
             features |= LnFeatures.OPTION_ZEROCONF_OPT
         LNWorker.__init__(self, self.node_keypair, features, config=self.config)
@@ -844,6 +847,7 @@ class LNWallet(LNWorker):
         self.logs = defaultdict(list)  # type: Dict[str, List[HtlcLog]]  # key is RHASH  # (not persisted)
         # used in tests
         self.enable_htlc_settle = True
+        self.enable_htlc_settle_onchain = True
         self.enable_htlc_forwarding = True
 
         # note: accessing channels (besides simple lookup) needs self.lock!
@@ -921,17 +925,8 @@ class LNWallet(LNWorker):
 
     @ignore_exceptions
     @log_exceptions
-    async def sync_with_local_watchtower(self):
-        watchtower = self.network.local_watchtower
-        if watchtower:
-            while True:
-                for chan in self.channels.values():
-                    await self.sync_channel_with_watchtower(chan, watchtower.sweepstore)
-                await asyncio.sleep(5)
-
-    @ignore_exceptions
-    @log_exceptions
     async def sync_with_remote_watchtower(self):
+        self.watchtower_ctns = {}
         while True:
             # periodically poll if the user updated 'watchtower_url'
             await asyncio.sleep(5)
@@ -954,6 +949,9 @@ class LNWallet(LNWorker):
             except aiohttp.client_exceptions.ClientConnectorError:
                 self.logger.info(f'could not contact remote watchtower {watchtower_url}')
 
+    def get_watchtower_ctn(self, channel_point):
+        return self.watchtower_ctns.get(channel_point)
+
     async def sync_channel_with_watchtower(self, chan: Channel, watchtower):
         outpoint = chan.funding_outpoint.to_str()
         addr = chan.get_funding_address()
@@ -963,6 +961,7 @@ class LNWallet(LNWorker):
             sweeptxs = chan.create_sweeptxs_for_watchtower(ctn)
             for tx in sweeptxs:
                 await watchtower.add_sweep_tx(outpoint, ctn, tx.inputs()[0].prevout.to_str(), tx.serialize())
+            self.watchtower_ctns[outpoint] = ctn
 
     def start_network(self, network: 'Network'):
         super().start_network(network)
@@ -981,7 +980,6 @@ class LNWallet(LNWorker):
                 self.maybe_listen(),
                 self.lnwatcher.trigger_callbacks(), # shortcut (don't block) if funding tx locked and verified
                 self.reestablish_peers_and_channels(),
-                self.sync_with_local_watchtower(),
                 self.sync_with_remote_watchtower(),
         ]:
             tg_coro = self.taskgroup.spawn(coro)
@@ -1287,6 +1285,8 @@ class LNWallet(LNWorker):
             zeroconf: bool = False,
             opening_fee: int = None,
             password=None):
+        if self.config.ENABLE_ANCHOR_CHANNELS:
+            self.wallet.unlock(password)
         coins = self.wallet.get_spendable_coins(None)
         node_id = peer.pubkey
         funding_tx = self.mktx_for_open_channel(
@@ -2373,10 +2373,10 @@ class LNWallet(LNWorker):
 
     def get_invoice_status(self, invoice: BaseInvoice) -> int:
         invoice_id = invoice.rhash
-        if invoice_id in self.inflight_payments:
+        status = self.get_payment_status(bfh(invoice_id))
+        if status == PR_UNPAID and invoice_id in self.inflight_payments:
             return PR_INFLIGHT
         # status may be PR_FAILED
-        status = self.get_payment_status(bytes.fromhex(invoice_id))
         if status == PR_UNPAID and invoice_id in self.logs:
             status = PR_FAILED
         return status
@@ -2389,7 +2389,7 @@ class LNWallet(LNWorker):
         if status in SAVED_PR_STATUS:
             self.set_payment_status(bfh(key), status)
         util.trigger_callback('invoice_status', self.wallet, key, status)
-        self.logger.info(f"invoice status triggered (2) for key {key} and status {status}")
+        self.logger.info(f"set_invoice_status {key}: {status}")
         # liquidity changed
         self.clear_invoices_cache()
 

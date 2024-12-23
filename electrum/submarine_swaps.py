@@ -168,11 +168,11 @@ def create_claim_tx(
     """Create tx to either claim successful reverse-swap,
     or to get refunded for timed-out forward-swap.
     """
+    txin.nsequence = 0xffffffff - 2
     txin.script_sig = b''
     txin.witness_script = witness_script
     txout = PartialTxOutput.from_address_and_value(address, amount_sat)
     tx = PartialTransaction.from_io([txin], [txout], version=2, locktime=locktime)
-    tx.set_rbf(True)
     return tx
 
 
@@ -211,7 +211,7 @@ class SwapManager(Logger):
         for k, swap in self.swaps.items():
             if swap.prepay_hash is not None:
                 self.prepayments[swap.prepay_hash] = bytes.fromhex(k)
-        self.is_server = self.config.get('enable_plugin_swapserver', False)
+        self.is_server = False # overriden by swapserver plugin if enabled
         self.is_initialized = asyncio.Event()
 
     def start_network(self, network: 'Network'):
@@ -468,7 +468,7 @@ class SwapManager(Logger):
                 for batch_rbf in [False]:
                     # FIXME: tx batching is disabled, because extra logic is needed to handle
                     # the case where the base tx gets mined.
-                    tx = self.create_funding_tx(swap, None, password=password, batch_rbf=batch_rbf)
+                    tx = self.create_funding_tx(swap, None, password=password)
                     self.logger.info(f'adding funding_tx {tx.txid()}')
                     self.wallet.adb.add_transaction(tx)
                     try:
@@ -779,7 +779,6 @@ class SwapManager(Logger):
         tx: Optional[PartialTransaction],
         *,
         password,
-        batch_rbf: Optional[bool] = None,
     ) -> PartialTransaction:
         # create funding tx
         # note: rbf must not decrease payment
@@ -790,7 +789,6 @@ class SwapManager(Logger):
                 outputs=[funding_output],
                 rbf=True,
                 password=password,
-                batch_rbf=batch_rbf,
             )
         else:
             tx.replace_output_address(DummyAddress.SWAP, swap.lockup_address)
@@ -1077,6 +1075,7 @@ class SwapManager(Logger):
         sig_dummy = b'\x00' * 71  # DER-encoded ECDSA sig, with low S and low R
         witness = [sig_dummy, preimage, witness_script]
         txin.witness_sizehint = len(construct_witness(witness))
+        txin.nsequence = 0xffffffff - 2
 
     @classmethod
     def sign_tx(cls, tx: PartialTransaction, swap: SwapData) -> None:
@@ -1122,6 +1121,8 @@ class SwapManager(Logger):
     def max_amount_forward_swap(self) -> Optional[int]:
         """ returns None if we cannot swap """
         max_swap_amt_ln = self.get_max_amount()
+        if max_swap_amt_ln is None:
+            return None
         max_recv_amt_ln = int(self.lnworker.num_sats_can_receive())
         max_amt_ln = int(min(max_swap_amt_ln, max_recv_amt_ln))
         max_amt_oc = self.get_send_amount(max_amt_ln, is_reverse=False) or 0

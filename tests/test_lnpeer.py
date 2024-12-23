@@ -45,8 +45,12 @@ from electrum.invoices import PR_PAID, PR_UNPAID
 from electrum.interface import GracefulDisconnect
 from electrum.simple_config import SimpleConfig
 
+
+
 from .test_lnchannel import create_test_channels
+from .test_bitcoin import needs_test_with_all_chacha20_implementations
 from . import ElectrumTestCase
+
 
 def keypair():
     priv = ECPrivkey.generate_random_key().get_secret_bytes()
@@ -131,6 +135,10 @@ class MockWallet:
     def get_fingerprint(self):
         return ''
 
+    def get_new_sweep_address_for_channel(self):
+        # note: sweep is not tested here, only in regtest
+        return "tb1qqu5newtapamjchgxf0nty6geuykhvwas45q4q4"
+
 
 class MockLNGossip:
     def get_sync_progress_estimate(self):
@@ -144,7 +152,7 @@ class MockLNWallet(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
     MPP_SPLIT_PART_FRACTION = 1  # this disables the forced splitting
     MPP_SPLIT_PART_MINAMT_MSAT = 5_000_000
 
-    def __init__(self, *, local_keypair: Keypair, chans: Iterable['Channel'], tx_queue, name):
+    def __init__(self, *, local_keypair: Keypair, chans: Iterable['Channel'], tx_queue, name, has_anchors):
         self.name = name
         Logger.__init__(self)
         NetworkRetryManager.__init__(self, max_retry_delay_normal=1, init_retry_delay_normal=1)
@@ -169,6 +177,8 @@ class MockLNWallet(Logger, EventListener, NetworkRetryManager[LNPeerAddr]):
         self.features |= LnFeatures.OPTION_TRAMPOLINE_ROUTING_OPT_ELECTRUM
         self.features |= LnFeatures.OPTION_CHANNEL_TYPE_OPT
         self.features |= LnFeatures.OPTION_SCID_ALIAS_OPT
+        self.features |= LnFeatures.OPTION_STATIC_REMOTEKEY_OPT
+        self.config.ENABLE_ANCHOR_CHANNELS = has_anchors
         self.pending_payments = defaultdict(asyncio.Future)
         for chan in chans:
             chan.lnworker = self
@@ -387,7 +397,7 @@ low_fee_channel = {
 }
 
 depleted_channel = {
-    'local_balance_msat': 0,
+    'local_balance_msat': 330 * 1000, # local pays anchors
     'remote_balance_msat': 10 * bitcoin.COIN * 1000,
     'local_base_fee_msat': 1_000,
     'local_fee_rate_millionths': 1,
@@ -546,8 +556,8 @@ class TestPeerDirect(TestPeer):
         bob_channel.storage['node_id'] = bob_channel.node_id
         t1, t2 = transport_pair(k1, k2, alice_channel.name, bob_channel.name)
         q1, q2 = asyncio.Queue(), asyncio.Queue()
-        w1 = MockLNWallet(local_keypair=k1, chans=[alice_channel], tx_queue=q1, name=bob_channel.name)
-        w2 = MockLNWallet(local_keypair=k2, chans=[bob_channel], tx_queue=q2, name=alice_channel.name)
+        w1 = MockLNWallet(local_keypair=k1, chans=[alice_channel], tx_queue=q1, name=bob_channel.name, has_anchors=self.TEST_ANCHOR_CHANNELS)
+        w2 = MockLNWallet(local_keypair=k2, chans=[bob_channel], tx_queue=q2, name=alice_channel.name, has_anchors=self.TEST_ANCHOR_CHANNELS)
         self._lnworkers_created.extend([w1, w2])
         p1 = PeerInTests(w1, k2.pubkey, t1)
         p2 = PeerInTests(w2, k1.pubkey, t2)
@@ -1426,7 +1436,6 @@ class TestPeerForwarding(TestPeer):
         transports = {}
         workers = {}  # type: Dict[str, MockLNWallet]
         peers = {}
-
         # create channels
         for a, definition in graph_definition.items():
             for b, channel_def in definition.get('channels', {}).items():
@@ -1437,6 +1446,7 @@ class TestPeerForwarding(TestPeer):
                     bob_pubkey=keys[b].pubkey,
                     local_msat=channel_def['local_balance_msat'],
                     remote_msat=channel_def['remote_balance_msat'],
+                    anchor_outputs=self.TEST_ANCHOR_CHANNELS
                 )
                 channels[(a, b)], channels[(b, a)] = channel_ab, channel_ba
                 transport_ab, transport_ba = transport_pair(keys[a], keys[b], channel_ab.name, channel_ba.name)
@@ -1450,7 +1460,7 @@ class TestPeerForwarding(TestPeer):
         # create workers and peers
         for a, definition in graph_definition.items():
             channels_of_node = [c for k, c in channels.items() if k[0] == a]
-            workers[a] = MockLNWallet(local_keypair=keys[a], chans=channels_of_node, tx_queue=txs_queues[a], name=a)
+            workers[a] = MockLNWallet(local_keypair=keys[a], chans=channels_of_node, tx_queue=txs_queues[a], name=a, has_anchors=self.TEST_ANCHOR_CHANNELS)
         self._lnworkers_created.extend(list(workers.values()))
 
         # create peers
@@ -1486,6 +1496,9 @@ class TestPeerForwarding(TestPeer):
             print(f"{a:5s}: {keys[a].pubkey}")
             print(f"       {keys[a].pubkey.hex()}")
         return graph
+
+    async def test_payment_multihop(self):
+        graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['square_graph'])
 
     async def test_payment_multihop(self):
         graph = self.prepare_chans_and_peers_in_graph(self.GRAPH_DEFINITIONS['square_graph'])
@@ -1768,6 +1781,10 @@ class TestPeerForwarding(TestPeer):
                 async with OldTaskGroup() as g:
                     for peer in peers:
                         await g.spawn(peer.wait_one_htlc_switch_iteration())
+                # wait another iteration
+                async with OldTaskGroup() as g:
+                    for peer in peers:
+                        await g.spawn(peer.wait_one_htlc_switch_iteration())
                 for peer in peers:
                     self.assertEqual(len(peer.lnworker.received_mpp_htlcs), 0)
                 raise PaymentDone()
@@ -1972,3 +1989,13 @@ class TestPeerForwarding(TestPeer):
         with self.assertRaises(PaymentDone):
             graph = self.create_square_graph(direct=False, is_legacy=False)
             await self._run_trampoline_payment(graph)
+
+class TestPeerDirectAnchors(TestPeerDirect):
+    TEST_ANCHOR_CHANNELS = True
+
+class TestPeerForwardingAnchors(TestPeerForwarding):
+    TEST_ANCHOR_CHANNELS = True
+
+
+def run(coro):
+    return asyncio.run_coroutine_threadsafe(coro, loop=util.get_asyncio_loop()).result()
