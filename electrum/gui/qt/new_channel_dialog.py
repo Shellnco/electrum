@@ -1,25 +1,22 @@
 from typing import TYPE_CHECKING, Optional
-from PyQt6.QtWidgets import QLabel, QVBoxLayout, QGridLayout, QPushButton, QComboBox, QLineEdit, QSpacerItem, QWidget, QHBoxLayout
+from PyQt6.QtWidgets import QLabel, QVBoxLayout, QGridLayout, QPushButton, QComboBox, QLineEdit, QHBoxLayout
 
 import electrum_ecc as ecc
 
 from electrum.i18n import _
-from electrum.transaction import PartialTxOutput, PartialTransaction
 from electrum.lnutil import MIN_FUNDING_SAT
 from electrum.lnworker import hardcoded_trampoline_nodes
 from electrum.util import NotEnoughFunds, NoDynamicFeeEstimates
+from electrum.fee_policy import FeePolicy
+from electrum.lntransport import extract_nodeid, ConnStringFormatError
 
-from electrum.gui import messages
-from . import util
 from .util import (WindowModalDialog, Buttons, OkButton, CancelButton,
-                   EnterButton, ColorScheme, WWLabel, read_QIcon, IconLabel,
-                   char_width_in_lineedit)
+                   EnterButton, WWLabel, char_width_in_lineedit)
 from .amountedit import BTCAmountEdit
 from .my_treeview import create_toolbar_with_menu
 
 if TYPE_CHECKING:
     from .main_window import ElectrumWindow
-
 
 
 class NewChannelDialog(WindowModalDialog):
@@ -47,14 +44,18 @@ class NewChannelDialog(WindowModalDialog):
             vbox.addWidget(QLabel(_('Enter Remote Node ID or connection string or invoice')))
             self.remote_nodeid = QLineEdit()
             self.remote_nodeid.setMinimumWidth(700)
+            self.remote_nodeid.textChanged.connect(self.maybe_enable_ok_button)
             self.suggest_button = QPushButton(self, text=_('Suggest Peer'))
             self.suggest_button.clicked.connect(self.on_suggest)
         else:
             self.trampoline_combo = QComboBox()
             self.trampoline_combo.addItems(self.trampoline_names)
+            # index 1 is "Electrum trampoline" on mainnet, this defaults to -1 if 1 is not available
             self.trampoline_combo.setCurrentIndex(1)
+            self.trampoline_combo.currentIndexChanged.connect(self.maybe_enable_ok_button)
         self.amount_e = BTCAmountEdit(self.window.get_decimal_point)
         self.amount_e.setAmount(amount_sat)
+        self.amount_e.textChanged.connect(self.maybe_enable_ok_button)
 
         btn_width = 10 * char_width_in_lineedit()
         self.min_button = EnterButton(_("Min"), self.spend_min)
@@ -87,9 +88,26 @@ class NewChannelDialog(WindowModalDialog):
 
         vbox.addLayout(h)
         vbox.addStretch()
-        ok_button = OkButton(self)
-        ok_button.setDefault(True)
-        vbox.addLayout(Buttons(CancelButton(self), ok_button))
+        self.ok_button = OkButton(self)
+        self.ok_button.setDefault(True)
+        self.maybe_enable_ok_button()
+        vbox.addLayout(Buttons(CancelButton(self), self.ok_button))
+
+    def maybe_enable_ok_button(self):
+        enable = True
+        if self.network.channel_db:
+            try:
+                extract_nodeid(str(self.remote_nodeid.text()).strip())
+            except ConnStringFormatError:
+                enable = False
+        else:
+            try:
+                self.trampoline_names[self.trampoline_combo.currentIndex()]
+            except IndexError:
+                enable = False
+        if not self.amount_e.get_amount():
+            enable = False
+        self.ok_button.setEnabled(enable)
 
     def on_suggest(self):
         self.network.start_gossip()
@@ -97,7 +115,8 @@ class NewChannelDialog(WindowModalDialog):
         if not nodeid:
             self.remote_nodeid.setText("")
             self.remote_nodeid.setPlaceholderText(
-                "Please wait until the graph is synchronized to 30%, and then try again.")
+                _("Couldn't find suitable peer yet, try again later.")
+            )
         else:
             self.remote_nodeid.setText(nodeid)
         self.remote_nodeid.repaint()  # macOS hack for #6269
@@ -124,7 +143,7 @@ class NewChannelDialog(WindowModalDialog):
         dummy_nodeid = ecc.GENERATOR.get_public_key_bytes(compressed=True)
         make_tx = self.window.mktx_for_open_channel(funding_sat='!', node_id=dummy_nodeid)
         try:
-            tx = make_tx(None)
+            tx = make_tx(FeePolicy(self.config.FEE_POLICY))
         except (NotEnoughFunds, NoDynamicFeeEstimates) as e:
             self.max_button.setChecked(False)
             self.amount_e.setFrozen(False)

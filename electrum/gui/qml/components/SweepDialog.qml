@@ -117,9 +117,9 @@ ElDialog {
                                 var dialog = app.scanDialog.createObject(app, {
                                     hint: qsTr('Scan a private key')
                                 })
-                                dialog.onFound.connect(function() {
-                                    if (verifyPrivateKey(dialog.scanData))
-                                        addPrivateKey(dialog.scanData)
+                                dialog.onFoundText.connect(function(data) {
+                                    if (verifyPrivateKey(data))
+                                        addPrivateKey(data)
                                     dialog.close()
                                 })
                                 dialog.open()
@@ -143,7 +143,7 @@ ElDialog {
             Layout.preferredWidth: 1
             enabled: valid
             icon.source: '../../icons/tab_send.png'
-            text: qsTr('Sweep')
+            text: qsTr('Sweep...')
             onClicked: {
                 console.log('sweeping')
                 root.privateKeys = sweepkeys.text

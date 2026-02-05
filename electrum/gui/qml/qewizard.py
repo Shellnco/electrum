@@ -5,9 +5,10 @@ from PyQt6.QtCore import pyqtProperty, pyqtSignal, pyqtSlot, QObject
 
 from electrum.logging import get_logger
 from electrum import mnemonic
-from electrum.wizard import NewWalletWizard, ServerConnectWizard
+from electrum.wizard import NewWalletWizard, ServerConnectWizard, TermsOfUseWizard
 from electrum.storage import WalletStorage, StorageReadWriteError
 from electrum.util import WalletFileException
+from electrum.gui import messages
 
 if TYPE_CHECKING:
     from electrum.gui.qml.qedaemon import QEDaemon
@@ -67,14 +68,18 @@ class QENewWalletWizard(NewWalletWizard, QEAbstractWizard):
             'wallet_type': {'gui': 'WCWalletType'},
             'keystore_type': {'gui': 'WCKeystoreType'},
             'create_seed': {'gui': 'WCCreateSeed'},
+            'create_ext': {'gui': 'WCEnterExt'},
             'confirm_seed': {'gui': 'WCConfirmSeed'},
+            'confirm_ext': {'gui': 'WCConfirmExt'},
             'have_seed': {'gui': 'WCHaveSeed'},
+            'have_ext': {'gui': 'WCEnterExt'},
             'script_and_derivation': {'gui': 'WCScriptAndDerivation'},
             'have_master_key': {'gui': 'WCHaveMasterKey'},
             'multisig': {'gui': 'WCMultisig'},
             'multisig_cosigner_keystore': {'gui': 'WCCosignerKeystore'},
             'multisig_cosigner_key': {'gui': 'WCHaveMasterKey'},
             'multisig_cosigner_seed': {'gui': 'WCHaveSeed'},
+            'multisig_cosigner_have_ext': {'gui': 'WCEnterExt'},
             'multisig_cosigner_script_and_derivation': {'gui': 'WCScriptAndDerivation'},
             'imported': {'gui': 'WCImport'},
             'wallet_password': {'gui': 'WCWalletPassword'}
@@ -183,3 +188,19 @@ class QEServerConnectWizard(ServerConnectWizard, QEAbstractWizard):
             'proxy_config': {'gui': 'WCProxyConfig'},
             'server_config': {'gui': 'WCServerConfig'},
         })
+
+
+class QETermsOfUseWizard(TermsOfUseWizard, QEAbstractWizard):
+    def __init__(self, daemon: 'QEDaemon', parent=None):
+        TermsOfUseWizard.__init__(self, daemon.daemon.config)
+        QEAbstractWizard.__init__(self, parent)
+
+        # attach gui classes
+        self.navmap_merge({
+            'terms_of_use': {'gui': 'WCTermsOfUseRequest'},
+        })
+
+    termsOfUseChanged = pyqtSignal()
+    @pyqtProperty(str, notify=termsOfUseChanged)
+    def termsOfUseText(self):
+        return messages.MSG_TERMS_OF_USE

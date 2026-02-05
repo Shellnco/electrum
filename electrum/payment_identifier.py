@@ -14,11 +14,14 @@ from .logging import Logger
 from .util import parse_max_spend, InvoiceError
 from .util import get_asyncio_loop, log_exceptions
 from .transaction import PartialTxOutput
-from .lnurl import decode_lnurl, request_lnurl, callback_lnurl, LNURLError, lightning_address_to_url
+from .lnurl import (decode_lnurl, request_lnurl, callback_lnurl, LNURLError,
+                    lightning_address_to_url, try_resolve_lnurlpay, LNURL6Data,
+                    LNURL3Data, LNURLData)
 from .bitcoin import opcodes, construct_script
 from .lnaddr import LnInvoiceException
 from .lnutil import IncompatibleOrInsaneFeatures
 from .bip21 import parse_bip21_URI, InvalidBitcoinURI, LIGHTNING_URI_SCHEME, BITCOIN_BIP21_URI_SCHEME
+from .segwit_addr import bech32_decode
 from . import paymentrequest
 
 if TYPE_CHECKING:
@@ -26,23 +29,21 @@ if TYPE_CHECKING:
     from .transaction import Transaction
 
 
-def maybe_extract_lightning_payment_identifier(data: str) -> Optional[str]:
-    data = data.strip()  # whitespaces
-    data = data.lower()
-    if data.startswith(LIGHTNING_URI_SCHEME + ':ln'):
-        cut_prefix = LIGHTNING_URI_SCHEME + ':'
-        data = data[len(cut_prefix):]
-    if data.startswith('ln'):
-        return data
-    return None
+def maybe_extract_bech32_lightning_payment_identifier(data: str) -> Optional[str]:
+    data = remove_uri_prefix(data, prefix=LIGHTNING_URI_SCHEME)
+    if not data.startswith('ln'):
+        return None
+    decoded_bech32 = bech32_decode(data, ignore_long_length=True)
+    if not decoded_bech32.hrp or not decoded_bech32.data:
+        return None
+    return data
 
 
-def is_uri(data: str) -> bool:
-    data = data.lower()
-    if (data.startswith(LIGHTNING_URI_SCHEME + ":") or
-            data.startswith(BITCOIN_BIP21_URI_SCHEME + ':')):
-        return True
-    return False
+def remove_uri_prefix(data: str, *, prefix: str) -> str:
+    assert isinstance(data, str) and isinstance(prefix, str)
+    data = data.lower().strip()
+    data = data.removeprefix(prefix + ':')
+    return data
 
 
 RE_ALIAS = r'(.*?)\s*\<([0-9A-Za-z]{1,})\>'
@@ -59,10 +60,11 @@ class PaymentIdentifierState(IntEnum):
                             # of the channels Electrum supports (on-chain, lightning)
     NEED_RESOLVE = 3        # PI contains a recognized destination format, but needs an online resolve step
     LNURLP_FINALIZE = 4     # PI contains a resolved LNURLp, but needs amount and comment to resolve to a bolt11
-    MERCHANT_NOTIFY = 5     # PI contains a valid payment request and on-chain destination. It should notify
+    LNURLW_FINALIZE = 5     # PI contains resolved LNURLw, user needs to enter amount and initiate withdraw
+    MERCHANT_NOTIFY = 6     # PI contains a valid payment request and on-chain destination. It should notify
                             # the merchant payment processor of the tx after on-chain broadcast,
                             # and supply a refund address (bip70)
-    MERCHANT_ACK = 6        # PI notified merchant. nothing to be done.
+    MERCHANT_ACK = 7        # PI notified merchant. nothing to be done.
     ERROR = 50              # generic error
     NOT_FOUND = 51          # PI contains a recognized destination format, but resolve step was unsuccessful
     MERCHANT_ERROR = 52     # PI failed notifying the merchant after broadcasting onchain TX
@@ -76,11 +78,13 @@ class PaymentIdentifierType(IntEnum):
     BIP70 = 3
     MULTILINE = 4
     BOLT11 = 5
-    LNURLP = 6
-    EMAILLIKE = 7
-    OPENALIAS = 8
-    LNADDR = 9
-    DOMAINLIKE = 10
+    LNURL = 6  # before the resolve it's unknown if pi is LNURLP or LNURLW
+    LNURLP = 7
+    LNURLW = 8
+    EMAILLIKE = 9
+    OPENALIAS = 10
+    LNADDR = 11
+    DOMAINLIKE = 12
 
 
 class FieldsForGUI(NamedTuple):
@@ -132,8 +136,8 @@ class PaymentIdentifier(Logger):
         self.merchant_ack_status = None
         self.merchant_ack_message = None
         #
-        self.lnurl = None
-        self.lnurl_data = None
+        self.lnurl = None  # type: Optional[str]
+        self.lnurl_data = None # type: Optional[LNURLData]
 
         self.parse(text)
 
@@ -220,9 +224,9 @@ class PaymentIdentifier(Logger):
                 self.set_state(PaymentIdentifierState.INVALID)
             else:
                 self.set_state(PaymentIdentifierState.AVAILABLE)
-        elif invoice_or_lnurl := maybe_extract_lightning_payment_identifier(text):
+        elif invoice_or_lnurl := maybe_extract_bech32_lightning_payment_identifier(text):
             if invoice_or_lnurl.startswith('lnurl'):
-                self._type = PaymentIdentifierType.LNURLP
+                self._type = PaymentIdentifierType.LNURL
                 try:
                     self.lnurl = decode_lnurl(invoice_or_lnurl)
                     self.set_state(PaymentIdentifierState.NEED_RESOLVE)
@@ -285,13 +289,13 @@ class PaymentIdentifier(Logger):
                     'label': contact['name']
                 }
                 self.set_state(PaymentIdentifierState.AVAILABLE)
-            elif contact['type'] == 'openalias':
+            elif contact['type'] in ('openalias', 'lnaddress'):
                 self._type = PaymentIdentifierType.EMAILLIKE
                 self.emaillike = contact['address']
                 self.set_state(PaymentIdentifierState.NEED_RESOLVE)
-        elif re.match(RE_EMAIL, text):
+        elif re.match(RE_EMAIL, (maybe_emaillike := remove_uri_prefix(text, prefix=LIGHTNING_URI_SCHEME))):
             self._type = PaymentIdentifierType.EMAILLIKE
-            self.emaillike = text
+            self.emaillike = maybe_emaillike
             self.set_state(PaymentIdentifierState.NEED_RESOLVE)
         elif re.match(RE_DOMAIN, text):
             self._type = PaymentIdentifierType.DOMAINLIKE
@@ -311,19 +315,23 @@ class PaymentIdentifier(Logger):
     async def _do_resolve(self, *, on_finished: Callable[['PaymentIdentifier'], None] = None):
         try:
             if self.emaillike or self.domainlike:
-                # TODO: parallel lookup?
-                key = self.emaillike if self.emaillike else self.domainlike
-                data = await self.resolve_openalias(key)
-                if data:
-                    self.openalias_data = data
-                    self.logger.debug(f'OA: {data!r}')
-                    address = data.get('address')
-                    if not data.get('validated'):
-                        self.warning = _(
-                            'WARNING: the alias "{}" could not be validated via an additional '
-                            'security check, DNSSEC, and thus may not be correct.').format(key)
+                openalias_key = self.emaillike if self.emaillike else self.domainlike
+                openalias_task = asyncio.create_task(self.resolve_openalias(openalias_key))
+
+                # prefers lnurl over openalias if both are available
+                lnurl = lightning_address_to_url(self.emaillike) if self.emaillike else None
+                if lnurl is not None and (lnurl_result := await try_resolve_lnurlpay(lnurl)):
+                    openalias_task.cancel()
+                    self._type = PaymentIdentifierType.LNADDR
+                    self.lnurl = lnurl
+                    self.lnurl_data = lnurl_result
+                    self.set_state(PaymentIdentifierState.LNURLP_FINALIZE)
+                elif openalias_result := await openalias_task:
+                    self.openalias_data = openalias_result
+                    address = openalias_result.get('address')
                     try:
-                        assert bitcoin.is_address(address)
+                        # this assertion error message is shown in the GUI
+                        assert bitcoin.is_address(address), f"{_('Openalias address invalid')}: {address[:100]}"
                         scriptpubkey = bitcoin.address_to_script(address)
                         self._type = PaymentIdentifierType.OPENALIAS
                         self.spk = scriptpubkey
@@ -331,25 +339,11 @@ class PaymentIdentifier(Logger):
                     except Exception as e:
                         self.error = str(e)
                         self.set_state(PaymentIdentifierState.NOT_FOUND)
-                elif self.emaillike:
-                    lnurl = lightning_address_to_url(self.emaillike)
-                    try:
-                        data = await request_lnurl(lnurl)
-                        self._type = PaymentIdentifierType.LNADDR
-                        self.lnurl = lnurl
-                        self.lnurl_data = data
-                        self.set_state(PaymentIdentifierState.LNURLP_FINALIZE)
-                    except LNURLError as e:
-                        self.set_state(PaymentIdentifierState.NOT_FOUND)
-                    except Exception as e:
-                        # NOTE: any other exception is swallowed here (e.g. DNS error)
-                        # as the user may be typing and we have an incomplete emaillike
-                        self.set_state(PaymentIdentifierState.NOT_FOUND)
                 else:
                     self.set_state(PaymentIdentifierState.NOT_FOUND)
             elif self.bip70:
                 pr = await paymentrequest.get_payment_request(self.bip70)
-                if pr.verify():
+                if await pr.verify():
                     self.bip70_data = pr
                     self.set_state(PaymentIdentifierState.MERCHANT_NOTIFY)
                 else:
@@ -358,7 +352,14 @@ class PaymentIdentifier(Logger):
             elif self.lnurl:
                 data = await request_lnurl(self.lnurl)
                 self.lnurl_data = data
-                self.set_state(PaymentIdentifierState.LNURLP_FINALIZE)
+                if isinstance(data, LNURL6Data):
+                    self._type = PaymentIdentifierType.LNURLP
+                    self.set_state(PaymentIdentifierState.LNURLP_FINALIZE)
+                elif isinstance(data, LNURL3Data):
+                    self._type = PaymentIdentifierType.LNURLW
+                    self.set_state(PaymentIdentifierState.LNURLW_FINALIZE)
+                else:
+                    raise NotImplementedError(f"Invalid LNURL type? {data=}")
                 self.logger.debug(f'LNURL data: {data!r}')
             else:
                 self.set_state(PaymentIdentifierState.ERROR)
@@ -551,7 +552,7 @@ class PaymentIdentifier(Logger):
             raise Exception("Amount is empty")
         if parse_max_spend(x):
             return x
-        p = pow(10, self.config.get_decimal_point())
+        p = pow(10, self.config.BTC_AMOUNTS_DECIMAL_POINT)
         try:
             return int(p * Decimal(x))
         except InvalidOperation:
@@ -588,15 +589,12 @@ class PaymentIdentifier(Logger):
             name = self.openalias_data.get('name')
             description = name
             recipient = key + ' <' + address + '>'
-            validated = self.openalias_data.get('validated')
-            if not validated:
-                self.warning = _('WARNING: the alias "{}" could not be validated via an additional '
-                                 'security check, DNSSEC, and thus may not be correct.').format(key)
 
         elif self.bolt11:
             recipient, amount, description = self._get_bolt11_fields()
 
         elif self.lnurl and self.lnurl_data:
+            assert isinstance(self.lnurl_data, LNURL6Data), f"{self.lnurl_data=}"
             domain = urllib.parse.urlparse(self.lnurl).netloc
             recipient = f"{self.lnurl_data.metadata_plaintext} <{domain}>"
             description = self.lnurl_data.metadata_plaintext
@@ -649,14 +647,12 @@ class PaymentIdentifier(Logger):
         return pubkey, amount, description
 
     async def resolve_openalias(self, key: str) -> Optional[dict]:
-        # TODO: below check needed? we already matched RE_EMAIL/RE_DOMAIN
-        # if not (('.' in key) and ('<' not in key) and (' ' not in key)):
-        #     return None
         parts = key.split(sep=',')  # assuming single line
         if parts and len(parts) > 0 and bitcoin.is_address(parts[0]):
             return None
         try:
-            data = self.contacts.resolve(key)  # TODO: don't use contacts as delegate to resolve openalias, separate.
+            data = await self.contacts.resolve(key)  # TODO: don't use contacts as delegate to resolve openalias, separate.
+            self.logger.debug(f'OA: {data!r}')
             return data
         except AliasNotFoundException as e:
             self.logger.info(f'OpenAlias not found: {repr(e)}')
@@ -689,7 +685,7 @@ def invoice_from_payment_identifier(
         invoice = pi.bolt11
         if not invoice:
             return
-        if invoice.amount_msat is None:
+        if invoice._lnaddr.get_amount_msat() is None:
             invoice.set_amount_msat(int(amount_sat * 1000))
         return invoice
     else:

@@ -94,7 +94,7 @@ class QEChannelDetails(AuthMixin, QObject, QtEventListener):
     def name(self) -> str:
         if not self._channel:
             return ''
-        return self._wallet.wallet.lnworker.get_node_alias(self._channel.node_id) or ''
+        return self._wallet.wallet.lnworker.lnpeermgr.get_node_alias(self._channel.node_id) or ''
 
     @pyqtProperty(str, notify=channelChanged)
     def pubkey(self) -> str:
@@ -326,10 +326,4 @@ class QEChannelDetails(AuthMixin, QObject, QtEventListener):
 
     @pyqtSlot(result=str)
     def channelBackupHelpText(self):
-        return ' '.join([
-            _("Channel backups can be imported in another instance of the same wallet."),
-            _("In the Electrum mobile app, use the 'Send' button to scan this QR code."),
-            '\n\n',
-            _("Please note that channel backups cannot be used to restore your channels."),
-            _("If you lose your wallet file, the only thing you can do with a backup is to request your channel to be closed, so that your funds will be sent on-chain."),
-        ])
+        return messages.MSG_LN_EXPLAIN_SCB_BACKUPS

@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
-from typing import TYPE_CHECKING, Optional, Dict, Union, Sequence, Tuple, Iterable
+import ssl
+import threading
+from typing import TYPE_CHECKING, Optional, Dict, Sequence, Tuple, Iterable, List
 from decimal import Decimal
 import math
 import time
@@ -9,59 +11,63 @@ import time
 import attr
 import aiohttp
 
-import electrum_ecc as ecc
 from electrum_ecc import ECPrivkey
 
 import electrum_aionostr as aionostr
+import electrum_aionostr.key
+from electrum_aionostr.event import Event
 from electrum_aionostr.util import to_nip19
 
 from collections import defaultdict
 
 
-from . import lnutil
-from .crypto import sha256, hash_160
-from .bitcoin import (script_to_p2wsh, opcodes,
-                      construct_witness)
-from .transaction import PartialTxInput, PartialTxOutput, PartialTransaction, Transaction, TxInput, TxOutpoint
-from .transaction import script_GetOp, match_script_against_template, OPPushDataGeneric, OPPushDataPubkey
-from .util import log_exceptions, BelowDustLimit, OldTaskGroup, age
-from .lnutil import REDEEM_AFTER_DOUBLE_SPENT_DELAY
-from .bitcoin import dust_threshold, DummyAddress
+from .i18n import _
 from .logging import Logger
-from .lnutil import hex_to_bytes
+from .crypto import sha256, ripemd
+from .bitcoin import (script_to_p2wsh, opcodes, dust_threshold, DummyAddress, construct_witness,
+                      construct_script, address_to_script)
+from . import bitcoin
+from .transaction import (
+    PartialTxInput, PartialTxOutput, PartialTransaction, Transaction, TxInput, TxOutpoint, script_GetOp,
+    match_script_against_template, OPPushDataGeneric, OPPushDataPubkey, TxOutput,
+)
+from .util import (
+    log_exceptions, ignore_exceptions, BelowDustLimit, OldTaskGroup, ca_path, gen_nostr_ann_pow,
+    get_nostr_ann_pow_amount, make_aiohttp_proxy_connector, get_running_loop, get_asyncio_loop, wait_for2,
+    run_sync_function_on_asyncio_thread, trigger_callback, NoDynamicFeeEstimates, UserFacingException,
+)
+from . import lnutil
+from .lnutil import hex_to_bytes, REDEEM_AFTER_DOUBLE_SPENT_DELAY, Keypair
 from .lnaddr import lndecode
 from .json_db import StoredObject, stored_in
 from . import constants
-from .address_synchronizer import TX_HEIGHT_LOCAL
-from .i18n import _
-
-from .bitcoin import construct_script
-from .crypto import ripemd
-from .invoices import Invoice
-from .network import TxBroadcastError
+from .address_synchronizer import (TX_HEIGHT_LOCAL, TX_HEIGHT_FUTURE, TX_HEIGHT_UNCONFIRMED,
+                                   TX_HEIGHT_UNCONF_PARENT)
+from .fee_policy import FeePolicy
+from .invoices import Invoice, PR_PAID
 from .lnonion import OnionRoutingFailure, OnionFailureCode
+from .lnsweep import SweepInfo
 
 
 if TYPE_CHECKING:
     from .network import Network
     from .wallet import Abstract_Wallet
-    from .lnwatcher import LNWalletWatcher
+    from .lnwatcher import LNWatcher
     from .lnworker import LNWallet
     from .lnchannel import Channel
     from .simple_config import SimpleConfig
+    from aiohttp_socks import ProxyConnector
 
 
+SWAP_TX_SIZE = 150  # default tx size, used for mining fee estimation
 
-CLAIM_FEE_SIZE = 136
-LOCKUP_FEE_SIZE = 153 # assuming 1 output, 2 outputs
-
+MIN_SWAP_AMOUNT_SAT = 20_000
 MIN_LOCKTIME_DELTA = 60
 LOCKTIME_DELTA_REFUND = 70
 MAX_LOCKTIME_DELTA = 100
 MIN_FINAL_CLTV_DELTA_FOR_CLIENT = 3 * 144  # note: put in invoice, but is not enforced by receiver in lnpeer.py
 assert MIN_LOCKTIME_DELTA <= LOCKTIME_DELTA_REFUND <= MAX_LOCKTIME_DELTA
 assert MAX_LOCKTIME_DELTA < lnutil.MIN_FINAL_CLTV_DELTA_ACCEPTED
-assert MAX_LOCKTIME_DELTA < lnutil.MIN_FINAL_CLTV_DELTA_FOR_INVOICE
 assert MAX_LOCKTIME_DELTA < MIN_FINAL_CLTV_DELTA_FOR_CLIENT
 
 
@@ -73,71 +79,120 @@ assert MAX_LOCKTIME_DELTA < MIN_FINAL_CLTV_DELTA_FOR_CLIENT
 # different length which would still allow for claiming the onchain
 # coins but the invoice couldn't be settled
 
-WITNESS_TEMPLATE_REVERSE_SWAP = [
+# Unified witness-script for all swaps.  Historically with Boltz-backend, this was the reverse-swap script.
+WITNESS_TEMPLATE_SWAP = [
     opcodes.OP_SIZE,
-    OPPushDataGeneric(None),
+    OPPushDataGeneric(None),               # idx 1. length of preimage
     opcodes.OP_EQUAL,
     opcodes.OP_IF,
     opcodes.OP_HASH160,
-    OPPushDataGeneric(lambda x: x == 20),
+    OPPushDataGeneric(lambda x: x == 20),  # idx 5. payment_hash
     opcodes.OP_EQUALVERIFY,
-    OPPushDataPubkey,
+    OPPushDataPubkey,                      # idx 7. claim_pubkey
     opcodes.OP_ELSE,
     opcodes.OP_DROP,
-    OPPushDataGeneric(None),
+    OPPushDataGeneric(None),               # idx 10. locktime
     opcodes.OP_CHECKLOCKTIMEVERIFY,
     opcodes.OP_DROP,
-    OPPushDataPubkey,
+    OPPushDataPubkey,                      # idx 13. refund_pubkey
     opcodes.OP_ENDIF,
     opcodes.OP_CHECKSIG
 ]
 
 
-def check_reverse_redeem_script(
+def _check_swap_scriptcode(
     *,
     redeem_script: bytes,
     lockup_address: str,
     payment_hash: bytes,
     locktime: int,
-    refund_pubkey: bytes = None,
-    claim_pubkey: bytes = None,
+    refund_pubkey: Optional[bytes],   # note: We don't need to check the counterparty's key.
+    claim_pubkey: Optional[bytes],    #       Can use None in that case.
 ) -> None:
+    assert (refund_pubkey is not None) or (claim_pubkey is not None), "at least one pubkey must be set"
     parsed_script = [x for x in script_GetOp(redeem_script)]
-    if not match_script_against_template(redeem_script, WITNESS_TEMPLATE_REVERSE_SWAP):
+    if not match_script_against_template(redeem_script, WITNESS_TEMPLATE_SWAP):
         raise Exception("rswap check failed: scriptcode does not match template")
     if script_to_p2wsh(redeem_script) != lockup_address:
         raise Exception("rswap check failed: inconsistent scriptcode and address")
     if ripemd(payment_hash) != parsed_script[5][1]:
         raise Exception("rswap check failed: our preimage not in script")
-    if claim_pubkey and claim_pubkey != parsed_script[7][1]:
+    claim_pubkey = claim_pubkey or parsed_script[7][1]
+    if claim_pubkey != parsed_script[7][1]:
         raise Exception("rswap check failed: our pubkey not in script")
-    if refund_pubkey and refund_pubkey != parsed_script[13][1]:
+    refund_pubkey = refund_pubkey or parsed_script[13][1]
+    if refund_pubkey != parsed_script[13][1]:
         raise Exception("rswap check failed: our pubkey not in script")
     if locktime != int.from_bytes(parsed_script[10][1], byteorder='little'):
         raise Exception("rswap check failed: inconsistent locktime and script")
+    # let's just rebuild the full script from scratch...
+    if redeem_script != _construct_swap_scriptcode(
+        payment_hash=payment_hash,
+        locktime=locktime,
+        refund_pubkey=refund_pubkey,
+        claim_pubkey=claim_pubkey,
+    ):
+        raise Exception("failed to rebuild swap script from scratch")
+
+
+def _construct_swap_scriptcode(
+    payment_hash: bytes,
+    locktime: int,
+    refund_pubkey: bytes,
+    claim_pubkey: bytes,
+) -> bytes:
+    assert isinstance(payment_hash, bytes) and len(payment_hash) == 32
+    assert isinstance(locktime, int) and (0 <= locktime <= bitcoin.NLOCKTIME_BLOCKHEIGHT_MAX)
+    assert isinstance(refund_pubkey, bytes) and len(refund_pubkey) == 33
+    assert isinstance(claim_pubkey, bytes) and len(claim_pubkey) == 33
+    return construct_script(
+        WITNESS_TEMPLATE_SWAP,
+        values={1: 32, 5: ripemd(payment_hash), 7: claim_pubkey, 10: locktime, 13: refund_pubkey}
+    )
 
 
 class SwapServerError(Exception):
+    def __init__(self, message=None):
+        self.message = message
+        super().__init__(message)
+
     def __str__(self):
+        if self.message:
+            return self.message
         return _("The swap server errored or is unreachable.")
+
 
 def now():
     return int(time.time())
 
-@attr.s
+
+@attr.s(frozen=True)
 class SwapFees:
     percentage = attr.ib(type=int)
-    normal_fee = attr.ib(type=int)
-    lockup_fee = attr.ib(type=int)
-    claim_fee = attr.ib(type=int)
+    mining_fee = attr.ib(type=int)
     min_amount = attr.ib(type=int)
-    max_amount = attr.ib(type=int)
+    max_forward = attr.ib(type=int)
+    max_reverse = attr.ib(type=int)
+
+
+@attr.frozen
+class SwapOffer:
+    pairs = attr.ib(type=SwapFees)
+    relays = attr.ib(type=list[str])
+    pow_bits = attr.ib(type=int)
+    server_pubkey = attr.ib(type=str)
+    timestamp = attr.ib(type=int)
+
+    @property
+    def server_npub(self):
+        return to_nip19('npub', self.server_pubkey)
+
 
 @stored_in('submarine_swaps')
 @attr.s
 class SwapData(StoredObject):
     is_reverse = attr.ib(type=bool)  # for whoever is running code (PoV of client or server)
-    locktime = attr.ib(type=int)
+    locktime = attr.ib(type=int)  # onchain, abs
     onchain_amount = attr.ib(type=int)  # in sats
     lightning_amount = attr.ib(type=int)  # in sats
     redeem_script = attr.ib(type=bytes, converter=hex_to_bytes)
@@ -145,74 +200,73 @@ class SwapData(StoredObject):
     prepay_hash = attr.ib(type=Optional[bytes], converter=hex_to_bytes)
     privkey = attr.ib(type=bytes, converter=hex_to_bytes)
     lockup_address = attr.ib(type=str)
-    receive_address = attr.ib(type=str)
+    claim_to_output = attr.ib(type=Optional[Tuple[str, int]])  # address, amount to claim the funding utxo to
     funding_txid = attr.ib(type=Optional[str])
     spending_txid = attr.ib(type=Optional[str])
     is_redeemed = attr.ib(type=bool)
 
     _funding_prevout = None  # type: Optional[TxOutpoint]  # for RBF
     _payment_hash = None
+    _payment_pending = False # for forward swaps
 
     @property
     def payment_hash(self) -> bytes:
         return self._payment_hash
 
-def create_claim_tx(
-        *,
-        txin: PartialTxInput,
-        witness_script: bytes,
-        address: str,
-        amount_sat: int,
-        locktime: int,
-) -> PartialTransaction:
-    """Create tx to either claim successful reverse-swap,
-    or to get refunded for timed-out forward-swap.
-    """
-    txin.nsequence = 0xffffffff - 2
-    txin.script_sig = b''
-    txin.witness_script = witness_script
-    txout = PartialTxOutput.from_address_and_value(address, amount_sat)
-    tx = PartialTransaction.from_io([txin], [txout], version=2, locktime=locktime)
-    return tx
+    def is_funded(self) -> bool:
+        return self._payment_pending or bool(self.funding_txid)
+
+
+def pubkey_to_rgb_color(swapserver_pubkey: str) -> Tuple[int, int, int]:
+    assert isinstance(swapserver_pubkey, str), type(swapserver_pubkey)
+    assert len(swapserver_pubkey) == 64, len(swapserver_pubkey)
+    input_hash = int.from_bytes(sha256(swapserver_pubkey), byteorder="big")
+    r = (input_hash & 0xFF0000) >> 16
+    g = (input_hash & 0x00FF00) >> 8
+    b = input_hash & 0x0000FF
+    return r, g, b
 
 
 class SwapManager(Logger):
 
     network: Optional['Network'] = None
-    lnwatcher: Optional['LNWalletWatcher'] = None
+    lnwatcher: Optional['LNWatcher'] = None
 
     def __init__(self, *, wallet: 'Abstract_Wallet', lnworker: 'LNWallet'):
         Logger.__init__(self)
-        self.normal_fee = None
-        self.lockup_fee = None
-        self.claim_fee = None # part of the boltz prococol, not used by Electrum
+        self.mining_fee = None
         self.percentage = None
         self._min_amount = None
-        self._max_amount = None
+        self._max_forward = None
+        self._max_reverse = None
 
         self.wallet = wallet
         self.config = wallet.config
         self.lnworker = lnworker
+        self.lnwatcher = self.lnworker.lnwatcher
         self.config = wallet.config
         self.taskgroup = OldTaskGroup()
         self.dummy_address = DummyAddress.SWAP
 
-        self.swaps = self.wallet.db.get_dict('submarine_swaps')  # type: Dict[str, SwapData]
+        # note: accessing swaps dicts (besides simple lookup) needs swaps_lock
+        self.swaps_lock = threading.Lock()
+        self._swaps = self.wallet.db.get_dict('submarine_swaps')  # type: Dict[str, SwapData]
         self._swaps_by_funding_outpoint = {}  # type: Dict[TxOutpoint, SwapData]
         self._swaps_by_lockup_address = {}  # type: Dict[str, SwapData]
-        for payment_hash_hex, swap in self.swaps.items():
+        for payment_hash_hex, swap in self._swaps.items():
             payment_hash = bytes.fromhex(payment_hash_hex)
             swap._payment_hash = payment_hash
-            self._add_or_reindex_swap(swap)
-            if not swap.is_reverse and not swap.is_redeemed:
+            self._add_or_reindex_swap(swap, is_new=False)
+            if not swap.is_reverse and not swap.is_redeemed and not self.lnworker.get_preimage(swap.payment_hash):
                 self.lnworker.register_hold_invoice(payment_hash, self.hold_invoice_callback)
 
-        self.prepayments = {}  # type: Dict[bytes, bytes] # fee_rhash -> rhash
-        for k, swap in self.swaps.items():
+        self._prepayments = {}  # type: Dict[bytes, bytes] # fee_rhash -> rhash
+        for k, swap in self._swaps.items():
             if swap.prepay_hash is not None:
-                self.prepayments[swap.prepay_hash] = bytes.fromhex(k)
-        self.is_server = False # overriden by swapserver plugin if enabled
+                self._prepayments[swap.prepay_hash] = bytes.fromhex(k)
+        self.is_server = False # overridden by swapserver plugin if enabled
         self.is_initialized = asyncio.Event()
+        self.pairs_updated = asyncio.Event()
 
     def start_network(self, network: 'Network'):
         assert network
@@ -221,8 +275,9 @@ class SwapManager(Logger):
             return
         self.logger.info('start_network: starting main loop')
         self.network = network
-        self.lnwatcher = self.lnworker.lnwatcher
-        for k, swap in self.swaps.items():
+        with self.swaps_lock:
+            swaps_items = list(self._swaps.items())
+        for k, swap in swaps_items:
             if swap.is_redeemed:
                 continue
             self.add_lnwatcher_callback(swap)
@@ -230,14 +285,39 @@ class SwapManager(Logger):
 
     @log_exceptions
     async def run_nostr_server(self):
+        await self.set_nostr_proof_of_work()
+
+        while self.wallet.has_password() and self.wallet.get_unlocked_password() is None:
+            self.logger.info("This wallet is password-protected. Please unlock it to start the swapserver plugin")
+            await asyncio.sleep(10)
+
         with NostrTransport(self.config, self, self.lnworker.nostr_keypair) as transport:
             await transport.is_connected.wait()
             self.logger.info(f'nostr is connected')
+            # will publish a new announcement if liquidity changed or every OFFER_UPDATE_INTERVAL_SEC
+            last_update = time.time()
             while True:
-                # todo: publish everytime fees have changed
-                self.server_update_pairs()
+                await asyncio.sleep(transport.LIQUIDITY_UPDATE_INTERVAL_SEC)
+
+                previous_max_forward = self._max_forward
+                previous_max_reverse = self._max_reverse
+                previous_mining_fee = self.mining_fee
+                try:
+                    self.server_update_pairs()
+                except Exception:
+                    self.logger.exception("server_update_pairs failed")
+                    continue
+
+                liquidity_changed = self._max_forward != previous_max_forward \
+                                        or self._max_reverse != previous_max_reverse
+                mining_fees_changed = self.mining_fee != previous_mining_fee
+                if liquidity_changed or mining_fees_changed:
+                    self.logger.debug(f"updating announcement: {liquidity_changed=}, {mining_fees_changed=}")
+                elif time.time() - last_update < transport.OFFER_UPDATE_INTERVAL_SEC:
+                    continue
+
                 await transport.publish_offer(self)
-                await asyncio.sleep(600)
+                last_update = time.time()
 
     @log_exceptions
     async def main_loop(self):
@@ -256,7 +336,7 @@ class SwapManager(Logger):
     async def stop(self):
         await self.taskgroup.cancel_remaining()
 
-    def create_transport(self):
+    def create_transport(self) -> 'SwapServerTransport':
         from .lnutil import generate_random_keypair
         if self.config.SWAPSERVER_URL:
             return HttpTransport(self.config, self)
@@ -264,12 +344,29 @@ class SwapManager(Logger):
             keypair = self.lnworker.nostr_keypair if self.is_server else generate_random_keypair()
             return NostrTransport(self.config, self, keypair)
 
+    async def set_nostr_proof_of_work(self) -> None:
+        current_pow = get_nostr_ann_pow_amount(
+            self.lnworker.nostr_keypair.pubkey[1:],
+            self.config.SWAPSERVER_ANN_POW_NONCE
+        )
+        if current_pow >= self.config.SWAPSERVER_POW_TARGET:
+            self.logger.debug(f"Reusing existing PoW nonce for nostr announcement.")
+            return
+
+        self.logger.info(f"Generating PoW for nostr announcement. Target: {self.config.SWAPSERVER_POW_TARGET}")
+        nonce, pow_amount = await gen_nostr_ann_pow(
+            self.lnworker.nostr_keypair.pubkey[1:],  # pubkey without prefix
+            self.config.SWAPSERVER_POW_TARGET,
+        )
+        self.logger.debug(f"Found {pow_amount} bits of work for Nostr announcement.")
+        self.config.SWAPSERVER_ANN_POW_NONCE = nonce
+
     async def pay_invoice(self, key):
         self.logger.info(f'trying to pay invoice {key}')
         self.invoices_to_pay[key] = 1000000000000 # lock
         try:
             invoice = self.wallet.get_invoice(key)
-            success, log = await self.lnworker.pay_invoice(invoice.lightning_invoice, attempts=10)
+            success, log = await self.lnworker.pay_invoice(invoice)
         except Exception as e:
             self.logger.info(f'exception paying {key}, will not retry')
             self.invoices_to_pay.pop(key, None)
@@ -294,7 +391,7 @@ class SwapManager(Logger):
         """ we must not have broadcast the funding tx """
         if swap is None:
             return
-        if swap.funding_txid is not None:
+        if swap.is_funded():
             self.logger.info(f'cannot cancel swap {swap.payment_hash.hex()}: already funded')
             return
         self._fail_swap(swap, 'user cancelled')
@@ -302,14 +399,39 @@ class SwapManager(Logger):
     def _fail_swap(self, swap: SwapData, reason: str):
         self.logger.info(f'failing swap {swap.payment_hash.hex()}: {reason}')
         if not swap.is_reverse and swap.payment_hash in self.lnworker.hold_invoice_callbacks:
+            # unregister_hold_invoice will fail pending htlcs if there is no preimage available
             self.lnworker.unregister_hold_invoice(swap.payment_hash)
-            payment_secret = self.lnworker.get_payment_secret(swap.payment_hash)
-            payment_key = swap.payment_hash + payment_secret
-            e = OnionRoutingFailure(code=OnionFailureCode.INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS, data=b'')
-            self.lnworker.save_forwarding_failure(payment_key.hex(), failure_message=e)
+            self.lnworker.delete_payment_info(swap.payment_hash.hex(), direction=lnutil.RECEIVED)
+            self.lnworker.clear_invoices_cache()
         self.lnwatcher.remove_callback(swap.lockup_address)
-        if swap.funding_txid is None:
-            self.swaps.pop(swap.payment_hash.hex())
+        if not swap.is_funded():
+            with self.swaps_lock:
+                if self._swaps.pop(swap.payment_hash.hex(), None) is None:
+                    self.logger.debug(f"swap {swap.payment_hash.hex()} has already been deleted.")
+                if swap._funding_prevout is not None:
+                    self._swaps_by_funding_outpoint.pop(swap._funding_prevout, None)
+                self._swaps_by_lockup_address.pop(swap.lockup_address, None)
+                if swap.prepay_hash is not None:
+                    self._prepayments.pop(swap.prepay_hash, None)
+                    if self.lnworker.get_payment_status(swap.prepay_hash, direction=lnutil.RECEIVED) != PR_PAID:
+                        self.lnworker.delete_payment_info(swap.prepay_hash.hex(), direction=lnutil.RECEIVED)
+                        self.lnworker.delete_payment_bundle(payment_hash=swap.payment_hash)
+                    if self.lnworker.get_payment_status(swap.prepay_hash, direction=lnutil.SENT) != PR_PAID:
+                        self.lnworker.delete_payment_info(swap.prepay_hash.hex(), direction=lnutil.SENT)
+                if self.lnworker.get_payment_status(swap.payment_hash, direction=lnutil.SENT) != PR_PAID:
+                    self.lnworker.delete_payment_info(swap.payment_hash.hex(), direction=lnutil.SENT)
+
+    @classmethod
+    def extract_preimage(cls, swap: SwapData, claim_tx: Transaction) -> Optional[bytes]:
+        for txin in claim_tx.inputs():
+            witness = txin.witness_elements()
+            if not witness or len(witness) < 2:
+                # tx may be unsigned
+                continue
+            preimage = witness[1]
+            if sha256(preimage) == swap.payment_hash:
+                return preimage
+        return None
 
     @log_exceptions
     async def _claim_swap(self, swap: SwapData) -> None:
@@ -339,58 +461,40 @@ class SwapManager(Logger):
             # note: swap.funding_txid can change due to RBF, it will get updated here:
             swap.funding_txid = txin.prevout.txid.hex()
             swap._funding_prevout = txin.prevout
-            self._add_or_reindex_swap(swap)  # to update _swaps_by_funding_outpoint
+            self._add_or_reindex_swap(swap, is_new=False)  # to update _swaps_by_funding_outpoint
             funding_height = self.lnwatcher.adb.get_tx_height(txin.prevout.txid.hex())
             spent_height = txin.spent_height
-            should_bump_fee = False
+            # set spending_txid (even if tx is local), for GUI grouping
+            swap.spending_txid = txin.spent_txid
+            # discard local spenders
+            if spent_height in [TX_HEIGHT_LOCAL, TX_HEIGHT_FUTURE]:
+                spent_height = None
             if spent_height is not None:
-                swap.spending_txid = txin.spent_txid
-                if spent_height > 0:
+                if spent_height > 0 and swap.preimage:
                     if current_height - spent_height > REDEEM_AFTER_DOUBLE_SPENT_DELAY:
                         self.logger.info(f'stop watching swap {swap.lockup_address}')
-                        self.lnwatcher.remove_callback(swap.lockup_address)
                         swap.is_redeemed = True
-                elif spent_height == TX_HEIGHT_LOCAL:
-                    if funding_height.conf > 0 or (swap.is_reverse and self.wallet.config.LIGHTNING_ALLOW_INSTANT_SWAPS):
-                        tx = self.lnwatcher.adb.get_transaction(txin.spent_txid)
-                        try:
-                            await self.network.broadcast_transaction(tx)
-                        except TxBroadcastError:
-                            self.logger.info(f'error broadcasting claim tx {txin.spent_txid}')
-                    elif funding_height.height == TX_HEIGHT_LOCAL:
-                        # the funding tx was double spent.
-                        # this will remove both funding and child (spending tx) from adb
-                        self.lnwatcher.adb.remove_transaction(swap.funding_txid)
-                        swap.funding_txid = None
-                        swap.spending_txid = None
-                else:
-                    # spending tx is in mempool
-                    pass
+                        # cleanup
+                        self.lnwatcher.remove_callback(swap.lockup_address)
+                        if not swap.is_reverse:
+                            self.lnworker.delete_payment_bundle(payment_hash=swap.payment_hash)
+                            self.lnworker.unregister_hold_invoice(swap.payment_hash)
 
             if not swap.is_reverse:
                 if swap.preimage is None and spent_height is not None:
                     # extract the preimage, add it to lnwatcher
                     claim_tx = self.lnwatcher.adb.get_transaction(txin.spent_txid)
-                    preimage = claim_tx.inputs()[0].witness_elements()[1]
-                    if sha256(preimage) == swap.payment_hash:
+                    preimage = self.extract_preimage(swap, claim_tx)
+                    if preimage:
                         swap.preimage = preimage
                         self.logger.info(f'found preimage: {preimage.hex()}')
-                        self.lnworker.preimages[swap.payment_hash.hex()] = preimage.hex()
-                        # note: we must check the payment secret before we broadcast the funding tx
+                        self.lnworker.save_preimage(swap.payment_hash, preimage)
                     else:
                         # this is our refund tx
                         if spent_height > 0:
                             self.logger.info(f'refund tx confirmed: {txin.spent_txid} {spent_height}')
                             self._fail_swap(swap, 'refund tx confirmed')
                             return
-                        else:
-                            claim_tx.add_info_from_wallet(self.wallet)
-                            claim_tx_fee = claim_tx.get_fee()
-                            recommended_fee = self.get_claim_fee()
-                            if claim_tx_fee * 1.1 < recommended_fee:
-                                should_bump_fee = True
-                                self.logger.info(f'claim tx fee too low {claim_tx_fee} < {recommended_fee}. we will bump the fee')
-
                 if remaining_time > 0:
                     # too early for refund
                     return
@@ -418,41 +522,104 @@ class SwapManager(Logger):
                     # for testing: do not create claim tx
                     return
 
-            if spent_height is not None and not should_bump_fee:
+            if spent_height is not None and spent_height > 0:
                 return
+            txin, locktime = self.create_claim_txin(txin=txin, swap=swap)
+            if swap.is_reverse and swap.claim_to_output:
+                asyncio.create_task(self._claim_to_output(swap, txin))
+                return
+            # note: there is no csv in the script, we just set this so that txbatcher waits for one confirmation
+            name = 'swap claim' if swap.is_reverse else 'swap refund'
+            can_be_batched = True
+            sweep_info = SweepInfo(
+                txin=txin,
+                cltv_abs=locktime,
+                txout=None,
+                name=name,
+                can_be_batched=can_be_batched,
+                dust_override=False,
+            )
             try:
-                tx = self._create_and_sign_claim_tx(txin=txin, swap=swap, config=self.wallet.config)
+                self.wallet.txbatcher.add_sweep_input('swaps', sweep_info)
             except BelowDustLimit:
                 self.logger.info('utxo value below dust threshold')
                 return
-            self.logger.info(f'adding claim tx {tx.txid()}')
-            self.wallet.adb.add_transaction(tx)
-            swap.spending_txid = tx.txid()
-            if funding_height.conf > 0 or (swap.is_reverse and self.wallet.config.LIGHTNING_ALLOW_INSTANT_SWAPS):
-                try:
-                    await self.network.broadcast_transaction(tx)
-                except TxBroadcastError:
-                    self.logger.info(f'error broadcasting claim tx {txin.spent_txid}')
+            except NoDynamicFeeEstimates:
+                self.logger.info('got NoDynamicFeeEstimates')
+                return
 
-    def get_claim_fee(self):
-        return self.get_fee(CLAIM_FEE_SIZE)
+    async def _claim_to_output(self, swap: SwapData, claim_txin: PartialTxInput):
+        """
+        Construct claim tx that spends exactly the funding utxo to the swap output, independent of the
+        current fee environment to guarantee the correct amount is being sent to the claim output which
+        might be an external address.
+        """
+        assert swap.claim_to_output, swap
+        txout = PartialTxOutput.from_address_and_value(swap.claim_to_output[0], swap.claim_to_output[1])
+        tx = PartialTransaction.from_io([claim_txin], [txout])
+        funding_tx_confirmed = self.wallet.adb.get_tx_height(swap.funding_txid).height() > TX_HEIGHT_UNCONFIRMED
+        already_broadcast = self.wallet.adb.get_tx_height(tx.txid()).height() >= TX_HEIGHT_UNCONF_PARENT
+        self.logger.debug(f"_claim_to_output: {funding_tx_confirmed=} {already_broadcast=}")
 
-    def get_fee(self, size):
-        # note: 'size' is in vbytes
-        return self._get_fee(size=size, config=self.wallet.config)
+        # add tx to db so it can be shown as future tx
+        if not self.wallet.adb.get_transaction(tx.txid()):
+            try:
+                self.wallet.adb.add_transaction(tx)
+            except Exception:
+                self.logger.exception("")
+                return
+            trigger_callback('wallet_updated', self)
 
-    @classmethod
-    def _get_fee(cls, *, size, config: 'SimpleConfig'):
-        return config.estimate_fee(size, allow_fallback_to_static_rates=True)
+        # set or update future tx wanted height if it has not been broadcast yet
+        local_height = self.network.get_local_height()
+        wanted_height = local_height + claim_txin.get_block_based_relative_locktime()
+        if not already_broadcast and self.wallet.adb.future_tx.get(tx.txid(), 0) < wanted_height:
+            self.wallet.adb.set_future_tx(tx.txid(), wanted_height=wanted_height)
+
+        if funding_tx_confirmed and not already_broadcast:
+            tx = self.wallet.sign_transaction(tx, password=None, ignore_warnings=True)
+            assert tx and tx.is_complete(), tx
+            try:
+                await self.wallet.network.broadcast_transaction(tx)
+            except Exception:
+                self.logger.exception(f"cannot broadcast swap to output claim tx")
+
+    def get_fee_for_txbatcher(self):
+        return self._get_tx_fee(self.config.FEE_POLICY_SWAPS)
+
+    def _get_tx_fee(self, policy_descriptor: str):
+        fee_policy = FeePolicy(policy_descriptor)
+        return fee_policy.estimate_fee(SWAP_TX_SIZE, network=self.network, allow_fallback_to_static_rates=True)
+
+    def _sanity_check_swap_costs(
+        self,
+        *,
+        incoming_sat: int,
+        outgoing_sat: int,
+    ) -> None:
+        """The user should have already seen the swap amounts, and hence the cost.
+        These are just some last-minute sanity checks that the cost of the swap is not insane.
+        """
+        costs_abs = outgoing_sat - incoming_sat
+        costs_ratio = 1 - incoming_sat / outgoing_sat
+        if costs_abs < 10_000:  # "small" amounts are exempt from checks
+            return
+        exc = UserFacingException(_("Total swap costs are insane.") + f"\n({costs_ratio=}, {costs_abs=} sat)")
+        if costs_ratio > 0.25:
+            raise exc
+        if costs_abs > 1_000_000:
+            if costs_ratio > 0.15:
+                raise exc
 
     def get_swap(self, payment_hash: bytes) -> Optional[SwapData]:
         # for history
-        swap = self.swaps.get(payment_hash.hex())
+        swap = self._swaps.get(payment_hash.hex())
         if swap:
             return swap
-        payment_hash = self.prepayments.get(payment_hash)
+        payment_hash = self._prepayments.get(payment_hash)
         if payment_hash:
-            return self.swaps.get(payment_hash.hex())
+            return self._swaps.get(payment_hash.hex())
+        return None
 
     def add_lnwatcher_callback(self, swap: SwapData) -> None:
         callback = lambda: self._claim_swap(swap)
@@ -461,33 +628,32 @@ class SwapManager(Logger):
     async def hold_invoice_callback(self, payment_hash: bytes) -> None:
         # note: this assumes the wallet has been unlocked
         key = payment_hash.hex()
-        if key in self.swaps:
-            swap = self.swaps[key]
-            if swap.funding_txid is None:
-                password = self.wallet.get_unlocked_password()
-                for batch_rbf in [False]:
-                    # FIXME: tx batching is disabled, because extra logic is needed to handle
-                    # the case where the base tx gets mined.
-                    tx = self.create_funding_tx(swap, None, password=password)
-                    self.logger.info(f'adding funding_tx {tx.txid()}')
-                    self.wallet.adb.add_transaction(tx)
-                    try:
-                        await self.broadcast_funding_tx(swap, tx)
-                    except TxBroadcastError:
-                        self.wallet.adb.remove_transaction(tx.txid())
-                        continue
-                    break
+        if swap := self._swaps.get(key):
+            if not swap.is_funded():
+                output = self.create_funding_output(swap)
+                self.wallet.txbatcher.add_payment_output('swaps', output)
+                swap._payment_pending = True
+        else:
+            self.logger.info(f'key not in swaps {key}')
 
     def create_normal_swap(self, *, lightning_amount_sat: int, payment_hash: bytes, their_pubkey: bytes = None):
         """ server method """
         assert lightning_amount_sat
+        if payment_hash.hex() in self._swaps:
+            raise Exception("payment_hash already in use")
         locktime = self.network.get_local_height() + LOCKTIME_DELTA_REFUND
+        if self.network.blockchain().is_tip_stale():
+            raise Exception("our blockchain tip is stale")
         our_privkey = os.urandom(32)
         our_pubkey = ECPrivkey(our_privkey).get_public_key_bytes(compressed=True)
         onchain_amount_sat = self._get_recv_amount(lightning_amount_sat, is_reverse=True) # what the client is going to receive
-        redeem_script = construct_script(
-            WITNESS_TEMPLATE_REVERSE_SWAP,
-            {1:32, 5:ripemd(payment_hash), 7:their_pubkey, 10:locktime, 13:our_pubkey}
+        if not onchain_amount_sat:
+            raise Exception("no onchain amount")
+        redeem_script = _construct_swap_scriptcode(
+            payment_hash=payment_hash,
+            locktime=locktime,
+            refund_pubkey=our_pubkey,
+            claim_pubkey=their_pubkey,
         )
         swap, invoice, prepay_invoice = self.add_normal_swap(
             redeem_script=redeem_script,
@@ -504,7 +670,7 @@ class SwapManager(Logger):
     def add_normal_swap(
             self, *,
             redeem_script: bytes,
-            locktime: int,  # onchain
+            locktime: int,  # onchain, abs
             onchain_amount_sat: int,
             lightning_amount_sat: int,
             payment_hash: bytes,
@@ -514,60 +680,74 @@ class SwapManager(Logger):
             min_final_cltv_expiry_delta: Optional[int] = None,
     ) -> Tuple[SwapData, str, Optional[str]]:
         """creates a hold invoice"""
+        if payment_hash.hex() in self._swaps:
+            raise Exception("payment_hash already in use")
         if prepay:
-            prepay_amount_sat = self.get_claim_fee() * 2
+            # server requests 2 * the mining fee as instantly settled prepayment so that the mining
+            # fees of the funding tx and potential timeout refund tx are always covered
+            prepay_amount_sat = self.mining_fee * 2
             invoice_amount_sat = lightning_amount_sat - prepay_amount_sat
         else:
             invoice_amount_sat = lightning_amount_sat
 
-        _, invoice = self.lnworker.get_bolt11_invoice(
-            payment_hash=payment_hash,
-            amount_msat=invoice_amount_sat * 1000,
+        # add payment info to lnworker
+        self.lnworker.add_payment_info_for_hold_invoice(
+            payment_hash,
+            lightning_amount_sat=invoice_amount_sat,
+            min_final_cltv_delta=min_final_cltv_expiry_delta or lnutil.MIN_FINAL_CLTV_DELTA_ACCEPTED,
+            exp_delay=300,
+        )
+        info = self.lnworker.get_payment_info(payment_hash, direction=lnutil.RECEIVED)
+        lnaddr1, invoice = self.lnworker.get_bolt11_invoice(
+            payment_info=info,
             message='Submarine swap',
-            expiry=300,
             fallback_address=None,
             channels=channels,
-            min_final_cltv_expiry_delta=min_final_cltv_expiry_delta,
         )
-        # add payment info to lnworker
-        self.lnworker.add_payment_info_for_hold_invoice(payment_hash, invoice_amount_sat)
+        margin_to_get_refund_tx_mined = MIN_LOCKTIME_DELTA
+        if not (locktime + margin_to_get_refund_tx_mined < self.network.get_local_height() + lnaddr1.get_min_final_cltv_delta()):
+            raise Exception(
+                f"onchain locktime ({locktime}+{margin_to_get_refund_tx_mined}) "
+                f"too close to LN-htlc-expiry ({self.network.get_local_height()+lnaddr1.get_min_final_cltv_delta()})")
 
         if prepay:
-            prepay_hash = self.lnworker.create_payment_info(amount_msat=prepay_amount_sat*1000)
-            _, prepay_invoice = self.lnworker.get_bolt11_invoice(
-                payment_hash=prepay_hash,
-                amount_msat=prepay_amount_sat * 1000,
-                message='Submarine swap mining fees',
-                expiry=300,
+            prepay_hash = self.lnworker.create_payment_info(
+                amount_msat=prepay_amount_sat*1000,
+                min_final_cltv_delta=min_final_cltv_expiry_delta or lnutil.MIN_FINAL_CLTV_DELTA_ACCEPTED,
+                exp_delay=300,
+            )
+            info = self.lnworker.get_payment_info(prepay_hash, direction=lnutil.RECEIVED)
+            lnaddr2, prepay_invoice = self.lnworker.get_bolt11_invoice(
+                payment_info=info,
+                message='Submarine swap prepayment',
                 fallback_address=None,
                 channels=channels,
-                min_final_cltv_expiry_delta=min_final_cltv_expiry_delta,
             )
             self.lnworker.bundle_payments([payment_hash, prepay_hash])
-            self.prepayments[prepay_hash] = payment_hash
+            self._prepayments[prepay_hash] = payment_hash
+            assert lnaddr1.get_min_final_cltv_delta() == lnaddr2.get_min_final_cltv_delta()
         else:
             prepay_invoice = None
             prepay_hash = None
 
         lockup_address = script_to_p2wsh(redeem_script)
-        receive_address = self.wallet.get_receiving_address()
         swap = SwapData(
             redeem_script=redeem_script,
-            locktime = locktime,
-            privkey = our_privkey,
-            preimage = None,
-            prepay_hash = prepay_hash,
-            lockup_address = lockup_address,
-            onchain_amount = onchain_amount_sat,
-            receive_address = receive_address,
-            lightning_amount = lightning_amount_sat,
-            is_reverse = False,
-            is_redeemed = False,
-            funding_txid = None,
-            spending_txid = None,
+            locktime=locktime,
+            privkey=our_privkey,
+            preimage=None,
+            prepay_hash=prepay_hash,
+            lockup_address=lockup_address,
+            onchain_amount=onchain_amount_sat,
+            claim_to_output=None,
+            lightning_amount=lightning_amount_sat,
+            is_reverse=False,
+            is_redeemed=False,
+            funding_txid=None,
+            spending_txid=None,
         )
         swap._payment_hash = payment_hash
-        self._add_or_reindex_swap(swap)
+        self._add_or_reindex_swap(swap, is_new=True)
         self.add_lnwatcher_callback(swap)
         return swap, invoice, prepay_invoice
 
@@ -575,14 +755,20 @@ class SwapManager(Logger):
         """ server method. """
         assert lightning_amount_sat is not None
         locktime = self.network.get_local_height() + LOCKTIME_DELTA_REFUND
+        if self.network.blockchain().is_tip_stale():
+            raise Exception("our blockchain tip is stale")
         privkey = os.urandom(32)
         our_pubkey = ECPrivkey(privkey).get_public_key_bytes(compressed=True)
         onchain_amount_sat = self._get_send_amount(lightning_amount_sat, is_reverse=False)
+        if not onchain_amount_sat:
+            raise Exception("no onchain amount")
         preimage = os.urandom(32)
         payment_hash = sha256(preimage)
-        redeem_script = construct_script(
-            WITNESS_TEMPLATE_REVERSE_SWAP,
-            {1:32, 5:ripemd(payment_hash), 7:our_pubkey, 10:locktime, 13:their_pubkey}
+        redeem_script = _construct_swap_scriptcode(
+            payment_hash=payment_hash,
+            locktime=locktime,
+            refund_pubkey=their_pubkey,
+            claim_pubkey=our_pubkey,
         )
         swap = self.add_reverse_swap(
             redeem_script=redeem_script,
@@ -606,49 +792,74 @@ class SwapManager(Logger):
         preimage: bytes,
         payment_hash: bytes,
         prepay_hash: Optional[bytes] = None,
+        claim_to_output: Optional[TxOutput] = None,
     ) -> SwapData:
+        if payment_hash.hex() in self._swaps:
+            raise Exception("payment_hash already in use")
+        assert sha256(preimage) == payment_hash
         lockup_address = script_to_p2wsh(redeem_script)
-        receive_address = self.wallet.get_receiving_address()
+        if claim_to_output is not None:
+            # the claim_to_output value needs to be lower than the funding utxo value, otherwise
+            # there are no funds left for the fee of the claim tx
+            assert claim_to_output.value < onchain_amount_sat, f"{claim_to_output=} >= {onchain_amount_sat=}"
+            claim_to_output = (claim_to_output.address, claim_to_output.value)
         swap = SwapData(
-            redeem_script = redeem_script,
-            locktime = locktime,
-            privkey = privkey,
-            preimage = preimage,
-            prepay_hash = prepay_hash,
-            lockup_address = lockup_address,
-            onchain_amount = onchain_amount_sat,
-            receive_address = receive_address,
-            lightning_amount = lightning_amount_sat,
-            is_reverse = True,
-            is_redeemed = False,
-            funding_txid = None,
-            spending_txid = None,
+            redeem_script=redeem_script,
+            locktime=locktime,
+            privkey=privkey,
+            preimage=preimage,
+            prepay_hash=prepay_hash,
+            lockup_address=lockup_address,
+            onchain_amount=onchain_amount_sat,
+            claim_to_output=claim_to_output,
+            lightning_amount=lightning_amount_sat,
+            is_reverse=True,
+            is_redeemed=False,
+            funding_txid=None,
+            spending_txid=None,
         )
         if prepay_hash:
-            self.prepayments[prepay_hash] = payment_hash
+            if prepay_hash in self._prepayments:
+                raise Exception("prepay_hash already in use")
+            self._prepayments[prepay_hash] = payment_hash
         swap._payment_hash = payment_hash
-        self._add_or_reindex_swap(swap)
+        self._add_or_reindex_swap(swap, is_new=True)
         self.add_lnwatcher_callback(swap)
         return swap
 
-    def server_add_swap_invoice(self, request):
+    def server_add_swap_invoice(self, request: dict) -> dict:
+        """ server method.
+        (client-forward-swap phase2)
+        """
         invoice = request['invoice']
         invoice = Invoice.from_bech32(invoice)
         key = invoice.rhash
         payment_hash = bytes.fromhex(key)
-        assert key in self.swaps
-        swap = self.swaps[key]
-        assert swap.lightning_amount == int(invoice.get_amount_sat())
-        self.wallet.save_invoice(invoice)
-        # check that we have the preimage
-        assert sha256(swap.preimage) == payment_hash
-        assert swap.spending_txid is None
-        self.invoices_to_pay[key] = 0
+        their_pubkey = bytes.fromhex(request['refundPublicKey'])
+        with self.swaps_lock:
+            assert key in self._swaps
+            swap = self._swaps[key]
+            assert swap.lightning_amount == int(invoice.get_amount_sat())
+            assert swap.is_reverse is True
+            # check that we have the preimage
+            assert sha256(swap.preimage) == payment_hash
+            assert swap.spending_txid is None
+            # check their_pubkey by recalculating redeem_script
+            our_pubkey = ECPrivkey(swap.privkey).get_public_key_bytes(compressed=True)
+            redeem_script = _construct_swap_scriptcode(
+                payment_hash=payment_hash, locktime=swap.locktime, refund_pubkey=their_pubkey, claim_pubkey=our_pubkey,
+            )
+            assert swap.redeem_script == redeem_script
+            assert key not in self.invoices_to_pay
+            self.invoices_to_pay[key] = 0
+            assert self.wallet.get_invoice(invoice.get_id()) is None
+            self.wallet.save_invoice(invoice)
         return {}
 
     async def normal_swap(
             self,
             *,
+            transport: 'SwapServerTransport',
             lightning_amount_sat: int,
             expected_onchain_amount_sat: int,
             password,
@@ -665,9 +876,9 @@ class SwapManager(Logger):
         cltv safety requirement: (onchain_locktime > LN_locktime),   otherwise server is vulnerable
 
         New flow:
-         - User requests swap
+         - User requests swap  (RPC 'createnormalswap')
          - Server creates preimage, sends RHASH to user
-         - User creates hold invoice, sends it to server
+         - User creates hold invoice, sends it to server  (RPC 'addswapinvoice')
          - Server sends HTLC, user holds it
          - User creates on-chain output locked to RHASH
          - Server spends the on-chain output using preimage (revealing the preimage)
@@ -677,20 +888,24 @@ class SwapManager(Logger):
         assert self.network
         assert self.lnwatcher
         swap, invoice = await self.request_normal_swap(
+            transport=transport,
             lightning_amount_sat=lightning_amount_sat,
             expected_onchain_amount_sat=expected_onchain_amount_sat,
             channels=channels,
         )
         tx = self.create_funding_tx(swap, tx, password=password)
-        return await self.wait_for_htlcs_and_broadcast(swap=swap, invoice=invoice, tx=tx)
+        return await self.wait_for_htlcs_and_broadcast(transport=transport, swap=swap, invoice=invoice, tx=tx)
 
     async def request_normal_swap(
-            self, transport,
-        *,
-        lightning_amount_sat: int,
-        expected_onchain_amount_sat: int,
-        channels: Optional[Sequence['Channel']] = None,
+            self,
+            *,
+            transport: 'SwapServerTransport',
+            lightning_amount_sat: int,
+            expected_onchain_amount_sat: int,
+            channels: Optional[Sequence['Channel']] = None,
     ) -> Tuple[SwapData, str]:
+        self._sanity_check_swap_costs(
+            incoming_sat=lightning_amount_sat, outgoing_sat=expected_onchain_amount_sat)
         await self.is_initialized.wait() # add timeout
         refund_privkey = os.urandom(32)
         refund_pubkey = ECPrivkey(refund_privkey).get_public_key_bytes(compressed=True)
@@ -700,20 +915,29 @@ class SwapManager(Logger):
             "refundPublicKey": refund_pubkey.hex()
         }
         data = await transport.send_request_to_server('createnormalswap', request_data)
-        payment_hash = bytes.fromhex(data["preimageHash"])
-
-        zeroconf = data["acceptZeroConf"]
-        onchain_amount = data["expectedAmount"]
-        locktime = data["timeoutBlockHeight"]
-        lockup_address = data["address"]
-        redeem_script = bytes.fromhex(data["redeemScript"])
+        try:
+            payment_hash = bytes.fromhex(data["preimageHash"])
+            assert len(payment_hash) == 32, len(payment_hash)
+            onchain_amount = data["expectedAmount"]
+            assert isinstance(onchain_amount, int), type(onchain_amount)
+            locktime = data["timeoutBlockHeight"]
+            assert isinstance(locktime, int), type(locktime)
+            lockup_address = data["address"]
+            assert isinstance(lockup_address, str), type(lockup_address)
+            assert bitcoin.is_address(lockup_address), lockup_address
+            redeem_script = bytes.fromhex(data["redeemScript"])
+        except Exception as e:
+            self.logger.error(f"failed to parse response from swapserver for createnormalswap: {e!r}")
+            raise SwapServerError("failed to parse response from swapserver for createnormalswap") from e
+        del data   # parsing done
         # verify redeem_script is built with our pubkey and preimage
-        check_reverse_redeem_script(
+        _check_swap_scriptcode(
             redeem_script=redeem_script,
             lockup_address=lockup_address,
             payment_hash=payment_hash,
             locktime=locktime,
             refund_pubkey=refund_pubkey,
+            claim_pubkey=None,
         )
 
         # check that onchain_amount is not more than what we estimated
@@ -723,6 +947,8 @@ class SwapManager(Logger):
         # verify that they are not locking up funds for too long
         if locktime - self.network.get_local_height() > MAX_LOCKTIME_DELTA:
             raise Exception("fswap check failed: locktime too far in future")
+        if self.network.blockchain().is_tip_stale():
+            raise Exception("our blockchain tip is stale")
 
         swap, invoice, _ = self.add_normal_swap(
             redeem_script=redeem_script,
@@ -744,11 +970,12 @@ class SwapManager(Logger):
         return swap, invoice
 
     async def wait_for_htlcs_and_broadcast(
-            self, transport,
-        *,
-        swap: SwapData,
-        invoice: str,
-        tx: Transaction,
+            self,
+            *,
+            transport: 'SwapServerTransport',
+            swap: SwapData,
+            invoice: str,
+            tx: Transaction,
     ) -> Optional[str]:
         await transport.is_connected.wait()
         payment_hash = swap.payment_hash
@@ -761,57 +988,66 @@ class SwapManager(Logger):
         self.lnworker.register_hold_invoice(payment_hash, callback)
 
         # send invoice to server and wait for htlcs
+        # note: server will link this RPC to our previous 'createnormalswap' RPC
+        #       - using the RHASH from invoice, and using refundPublicKey
+        #       - FIXME it would be safer to use a proper session-secret?!
         request_data = {
-            "preimageHash": payment_hash.hex(),
             "invoice": invoice,
             "refundPublicKey": refund_pubkey.hex(),
         }
-        data = await transport.send_request_to_server('addswapinvoice', request_data)
+        await transport.send_request_to_server('addswapinvoice', request_data)
         # wait for funding tx
         lnaddr = lndecode(invoice)
         while swap.funding_txid is None and not lnaddr.is_expired():
             await asyncio.sleep(0.1)
         return swap.funding_txid
 
+    def create_funding_output(self, swap: SwapData) -> PartialTxOutput:
+        return PartialTxOutput.from_address_and_value(swap.lockup_address, swap.onchain_amount)
+
     def create_funding_tx(
-        self,
-        swap: SwapData,
-        tx: Optional[PartialTransaction],
-        *,
-        password,
+            self,
+            swap: SwapData,
+            tx: Optional[PartialTransaction],
+            *,
+            password,
     ) -> PartialTransaction:
         # create funding tx
+        # use fee policy set by user (not using txbatcher)
+        fee_policy = FeePolicy(self.config.FEE_POLICY)
         # note: rbf must not decrease payment
         # this is taken care of in wallet._is_rbf_allowed_to_touch_tx_output
         if tx is None:
-            funding_output = PartialTxOutput.from_address_and_value(swap.lockup_address, swap.onchain_amount)
-            tx = self.wallet.create_transaction(
+            funding_output = self.create_funding_output(swap)
+            tx = self.wallet.make_unsigned_transaction(
                 outputs=[funding_output],
                 rbf=True,
-                password=password,
+                fee_policy=fee_policy,
             )
         else:
             tx.replace_output_address(DummyAddress.SWAP, swap.lockup_address)
             tx.set_rbf(True)
-            self.wallet.sign_transaction(tx, password)
+        self.wallet.sign_transaction(tx, password)
         return tx
 
     @log_exceptions
-    async def request_swap_for_tx(self, transport, tx: 'PartialTransaction') -> Optional[Tuple[SwapData, str, PartialTransaction]]:
-        for o in tx.outputs():
-            if o.address == self.dummy_address:
-                change_amount = o.value
-                break
-        else:
-            return
+    async def request_swap_for_amount(
+        self,
+        *,
+        transport: 'SwapServerTransport',
+        onchain_amount: int,
+    ) -> Optional[Tuple[SwapData, str]]:
         await self.is_initialized.wait()
-        lightning_amount_sat = self.get_recv_amount(change_amount, is_reverse=False)
+        lightning_amount_sat = self.get_recv_amount(onchain_amount, is_reverse=False)
+        if lightning_amount_sat is None:
+            raise SwapServerError(_("Swap amount outside of providers limits") + ":\n"
+                                  + _("min") + f": {self.get_min_amount()}\n"
+                                  + _("max") + f": {self.get_provider_max_reverse_amount()}")
         swap, invoice = await self.request_normal_swap(
-            transport,
-            lightning_amount_sat = lightning_amount_sat,
-            expected_onchain_amount_sat=change_amount)
-        tx.replace_output_address(DummyAddress.SWAP, swap.lockup_address)
-        return swap, invoice, tx
+            transport=transport,
+            lightning_amount_sat=lightning_amount_sat,
+            expected_onchain_amount_sat=onchain_amount)
+        return swap, invoice
 
     @log_exceptions
     async def broadcast_funding_tx(self, swap: SwapData, tx: Transaction) -> None:
@@ -819,15 +1055,18 @@ class SwapManager(Logger):
         await self.network.broadcast_transaction(tx)
 
     async def reverse_swap(
-            self, transport,
+            self,
             *,
+            transport: 'SwapServerTransport',
             lightning_amount_sat: int,
             expected_onchain_amount_sat: int,
+            prepayment_sat: int,
             channels: Optional[Sequence['Channel']] = None,
+            claim_to_output: Optional[TxOutput] = None,
     ) -> Optional[str]:
         """send on Lightning, receive on-chain
 
-        - User generates preimage, RHASH. Sends RHASH to server.
+        - User generates preimage, RHASH. Sends RHASH to server.  (RPC 'createswap')
         - Server creates an LN invoice for RHASH.
         - User pays LN invoice - except server needs to hold the HTLC as preimage is unknown.
             - if the server requested a fee prepayment (using 'minerFeeInvoice'),
@@ -838,10 +1077,17 @@ class SwapManager(Logger):
         - User spends on-chain output, revealing preimage.
         - Server fulfills HTLC using preimage.
 
+        cltv safety requirement: (onchain_locktime < LN_locktime),   otherwise server is vulnerable
+
         Note: expected_onchain_amount_sat is BEFORE deducting the on-chain claim tx fee.
+        Note: prepayment_sat is passed as argument instead of accessing self.mining_fee to ensure
+        the mining fees the user sees in the GUI are also the values used for the checks performed here.
+        We commit to prepayment_sat as it limits the max fee pre-payment amt, which the server is trusted with.
         """
         assert self.network
         assert self.lnwatcher
+        self._sanity_check_swap_costs(
+            incoming_sat=expected_onchain_amount_sat, outgoing_sat=lightning_amount_sat)
         privkey = os.urandom(32)
         our_pubkey = ECPrivkey(privkey).get_public_key_bytes(compressed=True)
         preimage = os.urandom(32)
@@ -849,21 +1095,33 @@ class SwapManager(Logger):
         request_data = {
             "type": "reversesubmarine",
             "pairId": "BTC/BTC",
-            "orderSide": "buy",
             "invoiceAmount": lightning_amount_sat,
             "preimageHash": payment_hash.hex(),
-            "claimPublicKey": our_pubkey.hex()
+            "claimPublicKey": our_pubkey.hex(),
         }
+        self.logger.debug(f'rswap: sending request for {lightning_amount_sat}')
         data = await transport.send_request_to_server('createswap', request_data)
-        invoice = data['invoice']
-        fee_invoice = data.get('minerFeeInvoice')
-        lockup_address = data['lockupAddress']
-        redeem_script = bytes.fromhex(data['redeemScript'])
-        locktime = data['timeoutBlockHeight']
-        onchain_amount = data["onchainAmount"]
-        response_id = data['id']
+        try:
+            invoice = data['invoice']
+            assert isinstance(invoice, str), type(invoice)
+            fee_invoice = data.get('minerFeeInvoice')
+            assert fee_invoice is None or isinstance(fee_invoice, str), type(fee_invoice)
+            lockup_address = data['lockupAddress']
+            assert isinstance(lockup_address, str), type(lockup_address)
+            assert bitcoin.is_address(lockup_address), lockup_address
+            redeem_script = bytes.fromhex(data['redeemScript'])
+            locktime = data['timeoutBlockHeight']
+            assert isinstance(locktime, int), type(locktime)
+            onchain_amount = data["onchainAmount"]
+            assert isinstance(onchain_amount, int), type(onchain_amount)
+            response_id = data['id']
+        except Exception as e:
+            self.logger.error(f"failed to parse response from swapserver for createswap: {e!r}")
+            raise SwapServerError("failed to parse response from swapserver for createswap") from e
+        del data  # parsing done
+        self.logger.debug(f'rswap: {response_id=}')
         # verify redeem_script is built with our pubkey and preimage
-        check_reverse_redeem_script(
+        _check_swap_scriptcode(
             redeem_script=redeem_script,
             lockup_address=lockup_address,
             payment_hash=payment_hash,
@@ -878,18 +1136,23 @@ class SwapManager(Logger):
         # verify that we will have enough time to get our tx confirmed
         if locktime - self.network.get_local_height() <= MIN_LOCKTIME_DELTA:
             raise Exception("rswap check failed: locktime too close")
+        if self.network.blockchain().is_tip_stale():
+            raise Exception("our blockchain tip is stale")
         # verify invoice payment_hash
-        lnaddr = self.lnworker._check_invoice(invoice)
+        lnaddr = self.lnworker._check_bolt11_invoice(invoice)
         invoice_amount = int(lnaddr.get_amount_sat())
         if lnaddr.paymenthash != payment_hash:
             raise Exception("rswap check failed: inconsistent RHASH and invoice")
-        # check that the lightning amount is what we requested
         if fee_invoice:
-            fee_lnaddr = self.lnworker._check_invoice(fee_invoice)
+            fee_lnaddr = self.lnworker._check_bolt11_invoice(fee_invoice)
+            if fee_lnaddr.get_amount_sat() > prepayment_sat:
+                raise SwapServerError(_("Mining fee requested by swap-server larger "
+                                        "than what was announced in their offer."))
             invoice_amount += fee_lnaddr.get_amount_sat()
             prepay_hash = fee_lnaddr.paymenthash
         else:
             prepay_hash = None
+        # check that the lightning amount is what we requested
         if int(invoice_amount) != lightning_amount_sat:
             raise Exception(f"rswap check failed: invoice_amount ({invoice_amount}) "
                             f"not what we requested ({lightning_amount_sat})")
@@ -902,53 +1165,90 @@ class SwapManager(Logger):
             payment_hash=payment_hash,
             prepay_hash=prepay_hash,
             onchain_amount_sat=onchain_amount,
-            lightning_amount_sat=lightning_amount_sat)
+            lightning_amount_sat=lightning_amount_sat,
+            claim_to_output=claim_to_output,
+        )
         # initiate fee payment.
         if fee_invoice:
-            asyncio.ensure_future(self.lnworker.pay_invoice(fee_invoice))
+            fee_invoice_obj = Invoice.from_bech32(fee_invoice)
+            asyncio.ensure_future(self.lnworker.pay_invoice(fee_invoice_obj))
         # we return if we detect funding
         async def wait_for_funding(swap):
             while swap.funding_txid is None:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.1)
         # initiate main payment
-        tasks = [asyncio.create_task(self.lnworker.pay_invoice(invoice, channels=channels)), asyncio.create_task(wait_for_funding(swap))]
+        invoice_obj = Invoice.from_bech32(invoice)
+        tasks = [asyncio.create_task(self.lnworker.pay_invoice(invoice_obj, channels=channels)), asyncio.create_task(wait_for_funding(swap))]
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         return swap.funding_txid
 
-    def _add_or_reindex_swap(self, swap: SwapData) -> None:
-        if swap.payment_hash.hex() not in self.swaps:
-            self.swaps[swap.payment_hash.hex()] = swap
-        if swap._funding_prevout:
-            self._swaps_by_funding_outpoint[swap._funding_prevout] = swap
-        self._swaps_by_lockup_address[swap.lockup_address] = swap
+    def _add_or_reindex_swap(self, swap: SwapData, *, is_new: bool) -> None:
+        with self.swaps_lock:
+            assert is_new == (swap.payment_hash.hex() not in self._swaps), is_new
+            if swap.payment_hash.hex() not in self._swaps:
+                self._swaps[swap.payment_hash.hex()] = swap
+            if swap._funding_prevout:
+                self._swaps_by_funding_outpoint[swap._funding_prevout] = swap
+            self._swaps_by_lockup_address[swap.lockup_address] = swap
 
     def server_update_pairs(self) -> None:
         """ for server """
-        self.percentage = float(self.config.SWAPSERVER_FEE_MILLIONTHS) / 10000
-        self._min_amount = 20000
-        self._max_amount = 10000000
-        self.normal_fee = self.get_fee(CLAIM_FEE_SIZE)
-        self.lockup_fee = self.get_fee(LOCKUP_FEE_SIZE)
-        self.claim_fee = self.get_fee(CLAIM_FEE_SIZE)
+        self.percentage = float(self.config.SWAPSERVER_FEE_MILLIONTHS) / 10000  # type: ignore
+        self._min_amount = MIN_SWAP_AMOUNT_SAT
+        oc_balance_sat: int = self.wallet.get_spendable_balance_sat()
+        max_forward: int = min(int(self.lnworker.num_sats_can_receive()), oc_balance_sat, 10000000)
+        max_reverse: int = min(int(self.lnworker.num_sats_can_send()), 10000000)
+        self._max_forward: int = self._keep_leading_digits(max_forward, 2)
+        self._max_reverse: int = self._keep_leading_digits(max_reverse, 2)
+        new_mining_fee = self.get_fee_for_txbatcher()
+        if self.mining_fee is None \
+                or abs(self.mining_fee - new_mining_fee) / self.mining_fee > 0.1:
+            self.mining_fee = new_mining_fee
 
-    def update_pairs(self, pairs):
+    @staticmethod
+    def _keep_leading_digits(num: int, digits: int) -> int:
+        """Reduces precision of num to `digits` leading digits."""
+        if num <= 0:
+            return 0
+        num_str = str(num)
+        zeroed_num_str = f"{num_str[:digits]}{(len(num_str[digits:])) * '0'}"
+        return int(zeroed_num_str)
+
+    def update_pairs(self, pairs: SwapFees):
         self.logger.info(f'updating fees {pairs}')
-        self.normal_fee = pairs.normal_fee
-        self.lockup_fee = pairs.lockup_fee
-        self.claim_fee = pairs.claim_fee
+        self.mining_fee = pairs.mining_fee
         self.percentage = pairs.percentage
         self._min_amount = pairs.min_amount
-        self._max_amount = pairs.max_amount
-        self.is_initialized.set()
+        self._max_forward = pairs.max_forward
+        self._max_reverse = pairs.max_reverse
+        self.trigger_pairs_updated_threadsafe()
 
-    def get_max_amount(self):
-        return self._max_amount
+    def trigger_pairs_updated_threadsafe(self):
+        def trigger():
+            self.is_initialized.set()
+            self.pairs_updated.set()
+            self.pairs_updated.clear()
 
-    def get_min_amount(self):
+        run_sync_function_on_asyncio_thread(trigger, block=True)
+
+    def get_provider_max_forward_amount(self) -> int:
+        """in sat"""
+        return self._max_forward
+
+    def get_provider_max_reverse_amount(self) -> int:
+        """in sat"""
+        return self._max_reverse
+
+    def get_min_amount(self) -> int:
+        """in satoshis"""
         return self._min_amount
 
-    def check_invoice_amount(self, x):
-        return x >= self.get_min_amount() and x <= self.get_max_amount()
+    def check_invoice_amount(self, x, is_reverse: bool) -> bool:
+        if is_reverse:
+            max_amount = self.get_provider_max_forward_amount()
+        else:
+            max_amount = self.get_provider_max_reverse_amount()
+        return self.get_min_amount() <= x <= max_amount
 
     def _get_recv_amount(self, send_amount: Optional[int], *, is_reverse: bool) -> Optional[int]:
         """For a given swap direction and amount we send, returns how much we will receive.
@@ -957,26 +1257,26 @@ class SwapManager(Logger):
         In the reverse direction, the result matches what the swap server returns as response["onchainAmount"].
         """
         if send_amount is None:
-            return
+            return None
         x = Decimal(send_amount)
         percentage = Decimal(self.percentage)
         if is_reverse:
-            if not self.check_invoice_amount(x):
-                return
+            if not self.check_invoice_amount(x, is_reverse):
+                return None
             # see/ref:
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L948
             percentage_fee = math.ceil(percentage * x / 100)
-            base_fee = self.lockup_fee
+            base_fee = self.mining_fee
             x -= percentage_fee + base_fee
             x = math.floor(x)
             if x < dust_threshold():
-                return
+                return None
         else:
-            x -= self.normal_fee
+            x -= self.mining_fee
             percentage_fee = math.ceil(x * percentage / (100 + percentage))
             x -= percentage_fee
-            if not self.check_invoice_amount(x):
-                return
+            if not self.check_invoice_amount(x, is_reverse):
+                return None
         x = int(x)
         return x
 
@@ -987,26 +1287,26 @@ class SwapManager(Logger):
         In the forward direction, the result matches what the swap server returns as response["expectedAmount"].
         """
         if not recv_amount:
-            return
+            return None
         x = Decimal(recv_amount)
         percentage = Decimal(self.percentage)
         if is_reverse:
             # see/ref:
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L928
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L958
-            base_fee = self.lockup_fee
+            base_fee = self.mining_fee
             x += base_fee
             x = math.ceil(x / ((100 - percentage) / 100))
-            if not self.check_invoice_amount(x):
-                return
+            if not self.check_invoice_amount(x, is_reverse):
+                return None
         else:
-            if not self.check_invoice_amount(x):
-                return
+            if not self.check_invoice_amount(x, is_reverse):
+                return None
             # see/ref:
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L708
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/rates/FeeProvider.ts#L90
             percentage_fee = math.ceil(percentage * x / 100)
-            x += percentage_fee + self.normal_fee
+            x += percentage_fee + self.mining_fee
         x = int(x)
         return x
 
@@ -1022,13 +1322,13 @@ class SwapManager(Logger):
                                 f"send_amount={send_amount} -> recv_amount={recv_amount} -> inverted_send_amount={inverted_send_amount}")
         # second, add on-chain claim tx fee
         if is_reverse and recv_amount is not None:
-            recv_amount -= self.get_claim_fee()
+            recv_amount -= self.get_fee_for_txbatcher()
         return recv_amount
 
     def get_send_amount(self, recv_amount: Optional[int], *, is_reverse: bool) -> Optional[int]:
         # first, add on-chain claim tx fee
         if is_reverse and recv_amount is not None:
-            recv_amount += self.get_claim_fee()
+            recv_amount += self.get_fee_for_txbatcher()
         # second, add percentage fee
         send_amount = self._get_send_amount(recv_amount, is_reverse=is_reverse)
         # sanity check calculation can be inverted
@@ -1047,13 +1347,12 @@ class SwapManager(Logger):
                 swaps.append(swap)
         return swaps
 
-    def get_swap_by_claim_tx(self, tx: Transaction) -> Optional[SwapData]:
-        # note: we don't batch claim txs atm (batch_rbf cannot combine them
-        #       as the inputs do not belong to the wallet)
-        if not (len(tx.inputs()) == 1 and len(tx.outputs()) == 1):
-            return None
-        txin = tx.inputs()[0]
-        return self.get_swap_by_claim_txin(txin)
+    def get_swaps_by_claim_tx(self, tx: Transaction) -> Iterable[Tuple[int, SwapData]]:
+        swaps = []
+        for i, txin in enumerate(tx.inputs()):
+            if swap := self.get_swap_by_claim_txin(txin):
+                swaps.append((i, swap))
+        return swaps
 
     def get_swap_by_claim_txin(self, txin: TxInput) -> Optional[SwapData]:
         return self._swaps_by_funding_outpoint.get(txin.prevout)
@@ -1061,13 +1360,11 @@ class SwapManager(Logger):
     def is_lockup_address_for_a_swap(self, addr: str) -> bool:
         return bool(self._swaps_by_lockup_address.get(addr))
 
-    def add_txin_info(self, txin: PartialTxInput) -> None:
+    @classmethod
+    def add_txin_info(cls, swap, txin: PartialTxInput) -> None:
         """Add some info to a claim txin.
         note: even without signing, this is useful for tx size estimation.
         """
-        swap = self.get_swap_by_claim_txin(txin)
-        if not swap:
-            return
         preimage = swap.preimage if swap.is_reverse else 0
         witness_script = swap.redeem_script
         txin.script_sig = b''
@@ -1075,52 +1372,33 @@ class SwapManager(Logger):
         sig_dummy = b'\x00' * 71  # DER-encoded ECDSA sig, with low S and low R
         witness = [sig_dummy, preimage, witness_script]
         txin.witness_sizehint = len(construct_witness(witness))
-        txin.nsequence = 0xffffffff - 2
+        txin.nsequence = 1 if swap.is_reverse else 0xffffffff - 2
 
     @classmethod
-    def sign_tx(cls, tx: PartialTransaction, swap: SwapData) -> None:
-        preimage = swap.preimage if swap.is_reverse else 0
-        witness_script = swap.redeem_script
-        txin = tx.inputs()[0]
-        assert len(tx.inputs()) == 1, f"expected 1 input for swap claim tx. found {len(tx.inputs())}"
-        assert txin.prevout.txid.hex() == swap.funding_txid
-        txin.script_sig = b''
-        txin.witness_script = witness_script
-        sig = tx.sign_txin(0, swap.privkey)
-        witness = [sig, preimage, witness_script]
-        txin.witness = construct_witness(witness)
-
-    @classmethod
-    def _create_and_sign_claim_tx(
-        cls,
-        *,
-        txin: PartialTxInput,
-        swap: SwapData,
-        config: 'SimpleConfig',
-    ) -> PartialTransaction:
-        # FIXME the mining fee should depend on swap.is_reverse.
-        #       the txs are not the same size...
-        amount_sat = txin.value_sats() - cls._get_fee(size=CLAIM_FEE_SIZE, config=config)
-        if amount_sat < dust_threshold():
-            raise BelowDustLimit()
+    def create_claim_txin(
+            cls,
+            *,
+            txin: PartialTxInput,
+            swap: SwapData,
+    ) -> Tuple[PartialTxInput, Optional[int]]:
         if swap.is_reverse:  # successful reverse swap
-            locktime = 0
+            locktime = None
             # preimage will be set in sign_tx
         else:  # timing out forward swap
             locktime = swap.locktime
-        tx = create_claim_tx(
-            txin=txin,
-            witness_script=swap.redeem_script,
-            address=swap.receive_address,
-            amount_sat=amount_sat,
-            locktime=locktime,
-        )
-        cls.sign_tx(tx, swap)
-        return tx
+        cls.add_txin_info(swap, txin)
+        txin.privkey = swap.privkey
+        def make_witness(sig):
+            # preimae not known yet
+            preimage = swap.preimage if swap.is_reverse else 0
+            witness_script = swap.redeem_script
+            return construct_witness([sig, preimage, witness_script])
+        txin.make_witness = make_witness
+        return txin, locktime
 
-    def max_amount_forward_swap(self) -> Optional[int]:
+    def client_max_amount_forward_swap(self) -> Optional[int]:
         """ returns None if we cannot swap """
-        max_swap_amt_ln = self.get_max_amount()
+        max_swap_amt_ln = self.get_provider_max_reverse_amount()
         if max_swap_amt_ln is None:
             return None
         max_recv_amt_ln = int(self.lnworker.num_sats_can_receive())
@@ -1128,6 +1406,15 @@ class SwapManager(Logger):
         max_amt_oc = self.get_send_amount(max_amt_ln, is_reverse=False) or 0
         min_amt_oc = self.get_send_amount(self.get_min_amount(), is_reverse=False) or 0
         return max_amt_oc if max_amt_oc >= min_amt_oc else None
+
+    def client_max_amount_reverse_swap(self) -> Optional[int]:
+        """Returns None if swap is not possible"""
+        provider_max = self.get_provider_max_forward_amount()
+        max_ln_send = int(self.lnworker.num_sats_can_send())
+        max_swap_size = min(max_ln_send, provider_max)
+        if max_swap_size < self.get_min_amount():
+            return None
+        return max_swap_size
 
     def server_create_normal_swap(self, request):
         # normal for client, reverse for server
@@ -1185,21 +1472,16 @@ class SwapManager(Logger):
     def get_groups_for_onchain_history(self):
         current_height = self.wallet.adb.get_local_height()
         d = {}
-        # add info about submarine swaps
-        settled_payments = self.lnworker.get_payments(status='settled')
-        for payment_hash_hex, swap in self.swaps.items():
+        with self.swaps_lock:
+            swaps_items = list(self._swaps.items())
+        for payment_hash_hex, swap in swaps_items:
             txid = swap.spending_txid if swap.is_reverse else swap.funding_txid
             if txid is None:
                 continue
-            payment_hash = bytes.fromhex(payment_hash_hex)
-            if payment_hash in settled_payments:
-                plist = settled_payments[payment_hash]
-                info = self.lnworker.get_payment_info(payment_hash)
-                direction, amount_msat, fee_msat, timestamp = self.lnworker.get_payment_value(info, plist)
-            else:
-                amount_msat = 0
 
-            if swap.is_reverse:
+            if swap.is_reverse and swap.claim_to_output:
+                group_label = 'Submarine Payment' + ' ' + self.config.format_amount_and_units(swap.claim_to_output[1])
+            elif swap.is_reverse:
                 group_label = 'Reverse swap' + ' ' + self.config.format_amount_and_units(swap.lightning_amount)
             else:
                 group_label = 'Forward swap' + ' ' + self.config.format_amount_and_units(swap.onchain_amount)
@@ -1208,112 +1490,190 @@ class SwapManager(Logger):
             delta = current_height - swap.locktime
             if self.wallet.adb.is_mine(swap.lockup_address):
                 tx_height = self.wallet.adb.get_tx_height(swap.funding_txid)
-                if swap.is_reverse and tx_height.height <= 0:
+                if swap.is_reverse and tx_height.height() <= 0:
                     label += ' (%s)' % _('waiting for funding tx confirmation')
                 if not swap.is_reverse and not swap.is_redeemed and swap.spending_txid is None and delta < 0:
                     label += f' (refundable in {-delta} blocks)' # fixme: only if unspent
             d[txid] = {
                 'group_id': txid,
-                'amount_msat': 0, # must be zero for onchain tx
-                'type': 'swap',
                 'label': label,
                 'group_label': group_label,
             }
             if not swap.is_reverse:
-                # if the spending_tx is in the wallet, this will add it
-                # to the group (see wallet.get_full_history)
-                d[swap.spending_txid] = {
-                    'group_id': txid,
-                    'amount_msat': 0, # must be zero for onchain tx
-                    'type': 'swap',
-                    'label': _('Refund transaction'),
+                claim_tx = self.lnwatcher.adb.get_transaction(swap.spending_txid)
+                if claim_tx and not self.extract_preimage(swap, claim_tx):
+                    # if the spending_tx is in the wallet, this will add it
+                    # to the group (see wallet.get_full_history)
+                    d[swap.spending_txid] = {
+                        'group_id': txid,
+                        'group_label': group_label,
+                        'label': _('Refund transaction'),
+                    }
+                    self.wallet._accounting_addresses.add(swap.lockup_address)
+            elif swap.is_reverse and swap.claim_to_output:  # submarine payment
+                claim_tx = self.lnwatcher.adb.get_transaction(swap.spending_txid)
+                payee_spk = address_to_script(swap.claim_to_output[0])
+                if claim_tx and payee_spk not in (o.scriptpubkey for o in claim_tx.outputs()):
+                    # the swapserver must have refunded itself as the claim_tx did not spend
+                    # to the address we intended it to spend to, remove the funding
+                    # address again from accounting addresses so the refund tx is not incorrectly
+                    # shown in the wallet history as tx spending from this wallet
+                    self.wallet._accounting_addresses.discard(swap.lockup_address)
+                # add the funding tx to the group as the total amount of the group would
+                # otherwise be ~2x the actual payment as the claim tx gets counted as negative
+                # value (as it sends from the wallet/accounting address balance)
+                d[swap.funding_txid] = {
+                     'group_id': txid,
+                     'label': _('Funding transaction'),
+                     'group_label': group_label,
                 }
+                # add the lockup_address as the claim tx would otherwise not touch the wallet and
+                # wouldn't be shown in the history.
+                self.wallet._accounting_addresses.add(swap.lockup_address)
+
         return d
 
-    def get_group_id_for_payment_hash(self, payment_hash):
+    def get_group_id_for_payment_hash(self, payment_hash: bytes) -> Optional[str]:
         # add group_id to swap transactions
         swap = self.get_swap(payment_hash)
         if swap:
-            if swap.is_reverse:
-                return swap.spending_txid
-            else:
-                return swap.funding_txid
+            return swap.spending_txid if swap.is_reverse else swap.funding_txid
+        return None
+
+    def get_pending_swaps(self) -> List[SwapData]:
+        """Returns a list of swaps with unconfirmed funding tx (which require us to stay online)."""
+        pending_swaps: List[SwapData] = []
+        with self.swaps_lock:
+            swaps = list(self._swaps.values())
+        for swap in swaps:
+            if swap.is_redeemed:
+                # adb data might have been removed after is_redeemed was set.
+                # in that case lnwatcher will no longer fetch the spending tx
+                # and adb will return TX_HEIGHT_LOCAL
+                continue
+            # note: adb.get_tx_height returns TX_HEIGHT_LOCAL if the txid is unknown
+            funding_height = self.lnworker.wallet.adb.get_tx_height(swap.funding_txid).height()
+            spending_height = self.lnworker.wallet.adb.get_tx_height(swap.spending_txid).height()
+            if funding_height > TX_HEIGHT_LOCAL and spending_height <= TX_HEIGHT_LOCAL:
+                pending_swaps.append(swap)
+        return pending_swaps
 
 
+class SwapServerTransport(Logger):
 
-class HttpTransport(Logger):
-
-    def __init__(self, config, sm):
+    def __init__(self, *, config: 'SimpleConfig', sm: 'SwapManager'):
         Logger.__init__(self)
         self.sm = sm
         self.network = sm.network
-        self.api_url = config.SWAPSERVER_URL
         self.config = config
         self.is_connected = asyncio.Event()
+        self.connect_timeout = 10 if self.uses_proxy else 5
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, ex_type, ex, tb):
+        pass
+
+    async def __aenter__(self):
+        pass
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    async def send_request_to_server(self, method: str, request_data: Optional[dict]) -> dict:
+        """Might raise SwapServerError."""
+        pass
+
+    @property
+    def uses_proxy(self):
+        return self.network.proxy and self.network.proxy.enabled
+
+
+class HttpTransport(SwapServerTransport):
+
+    def __init__(self, config, sm):
+        SwapServerTransport.__init__(self, config=config, sm=sm)
+        self.api_url = config.SWAPSERVER_URL
         self.is_connected.set()
 
     def __enter__(self):
-        asyncio.run_coroutine_threadsafe(self.get_pairs(), self.network.asyncio_loop)
+        asyncio.run_coroutine_threadsafe(self.get_pairs_just_once(), self.network.asyncio_loop)
         return self
 
     def __exit__(self, ex_type, ex, tb):
         pass
 
-    async def send_request_to_server(self, method, request_data):
-        response = await self.network.async_send_http_on_proxy(
-            'post' if request_data else 'get',
-            self.api_url + '/' + method,
-            json=request_data,
-            timeout=30)
-        return json.loads(response)
+    async def __aenter__(self):
+        asyncio.create_task(self.get_pairs_just_once())
+        return self
 
-    async def get_pairs(self) -> None:
-        """Might raise SwapServerError."""
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    async def send_request_to_server(self, method, request_data):
         try:
-            response = await self.send_request_to_server('getpairs', None)
+            response = await self.network.async_send_http_on_proxy(
+                'post' if request_data else 'get',
+                self.api_url + '/' + method,
+                json=request_data,
+                timeout=30)
         except aiohttp.ClientError as e:
-            self.logger.error(f"Swap server errored: {e!r}")
+            self.logger.info(f"Swap server errored: {e!r}")
             raise SwapServerError() from e
-        assert response.get('htlcFirst') is True
-        fees = response['pairs']['BTC/BTC']['fees']
-        limits = response['pairs']['BTC/BTC']['limits']
-        pairs = SwapFees(
-            percentage = fees['percentage'],
-            normal_fee = fees['minerFees']['baseAsset']['normal'],
-            lockup_fee = fees['minerFees']['baseAsset']['reverse']['lockup'],
-            claim_fee = fees['minerFees']['baseAsset']['reverse']['claim'],
-            min_amount = limits['minimal'],
-            max_amount = limits['maximal'],
-        )
+        try:
+            parsed_json = json.loads(response)
+            if not isinstance(parsed_json, dict):
+                raise Exception("malformed response, not dict")
+        except Exception as e:
+            self.logger.error(f"failed to parse response from swapserver for {method=}: {e!r}")
+            raise SwapServerError(f"failed to parse response from swapserver for {method=}") from e
+        return parsed_json
+
+    async def get_pairs_just_once(self) -> None:
+        """Might raise SwapServerError."""
+        response = await self.send_request_to_server('getpairs', None)
+        try:
+            assert response.get('htlcFirst') is True
+            fees = response['pairs']['BTC/BTC']['fees']
+            limits = response['pairs']['BTC/BTC']['limits']
+            pairs = SwapFees(
+                percentage=fees['percentage'],
+                mining_fee=fees['minerFees']['baseAsset']['mining_fee'],
+                min_amount=limits['minimal'],
+                max_forward=limits['max_forward_amount'],
+                max_reverse=limits['max_reverse_amount'],
+            )
+        except Exception as e:
+            self.logger.error(f"failed to parse response from swapserver for getpairs: {e!r}")
+            raise SwapServerError("failed to parse response from swapserver for getpairs") from e
         self.sm.update_pairs(pairs)
 
 
-
-class NostrTransport(Logger):
+class NostrTransport(SwapServerTransport):
     # uses nostr:
     #  - to advertise servers
     #  - for client-server RPCs (using DMs)
     #     (todo: we should use onion messages for that)
 
-    NOSTR_DM = 4
-    NOSTR_SWAP_OFFER = 10943
-    NOSTR_EVENT_TIMEOUT = 60*60*24
-    NOSTR_EVENT_VERSION = 1
+    EPHEMERAL_REQUEST = 25582
+    USER_STATUS_NIP38 = 30315
+    NOSTR_EVENT_VERSION = 5
+    OFFER_UPDATE_INTERVAL_SEC = 60 * 10
+    LIQUIDITY_UPDATE_INTERVAL_SEC = 30
 
-    def __init__(self, config, sm, keypair):
-        Logger.__init__(self)
-        self.config = config
-        self.network = sm.network
-        self.sm = sm
-        self.offers = {}
+    def __init__(self, config, sm, keypair: Keypair):
+        SwapServerTransport.__init__(self, config=config, sm=sm)
+        self._offers = {}  # type: Dict[str, SwapOffer]
         self.private_key = keypair.privkey
         self.nostr_private_key = to_nip19('nsec', keypair.privkey.hex())
         self.nostr_pubkey = keypair.pubkey.hex()[2:]
-        self.dm_replies = defaultdict(asyncio.Future)  # type: Dict[bytes, asyncio.Future]
-        self.relay_manager = aionostr.Manager(self.relays, private_key=self.nostr_private_key)
+        self.dm_replies = {}  # type: Dict[tuple[str, str], asyncio.Future[dict]]
+        self.ssl_context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cafile=ca_path)
+        self.relay_manager = None  # type: Optional[aionostr.Manager]
         self.taskgroup = OldTaskGroup()
-        self.is_connected = asyncio.Event()
-        self.server_relays = None
+        self._last_swapserver_relays = self._load_last_swapserver_relays()  # type: Optional[Sequence[str]]
+        self._swap_server_requests = asyncio.Queue(maxsize=5)  # type: asyncio.Queue[dict]
 
     def __enter__(self):
         asyncio.run_coroutine_threadsafe(self.main_loop(), self.network.asyncio_loop)
@@ -1323,10 +1683,18 @@ class NostrTransport(Logger):
         fut = asyncio.run_coroutine_threadsafe(self.stop(), self.network.asyncio_loop)
         fut.result(timeout=5)
 
+    async def __aenter__(self):
+        asyncio.create_task(self.main_loop())
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await wait_for2(self.stop(), timeout=5)
+
     @log_exceptions
     async def main_loop(self):
         self.logger.info(f'starting nostr transport with pubkey: {self.nostr_pubkey}')
         self.logger.info(f'nostr relays: {self.relays}')
+        self.relay_manager = self.get_relay_manager()
         await self.relay_manager.connect()
         connected_relays = self.relay_manager.relays
         self.logger.info(f'connected relays: {[relay.url for relay in connected_relays]}')
@@ -1335,12 +1703,13 @@ class NostrTransport(Logger):
         if self.sm.is_server:
             tasks = [
                 self.check_direct_messages(),
+                self._handle_requests(),
             ]
         else:
             tasks = [
                 self.check_direct_messages(),
-                self.receive_offers(),
-                self.get_pairs(),
+                self._get_pairs_loop(),
+                self.update_relays()
             ]
         try:
             async with self.taskgroup as group:
@@ -1355,149 +1724,303 @@ class NostrTransport(Logger):
     async def stop(self):
         self.logger.info("shutting down nostr transport")
         self.sm.is_initialized.clear()
+        self.is_connected.clear()
         await self.taskgroup.cancel_remaining()
         await self.relay_manager.close()
+        self.logger.info("nostr transport shut down")
 
     @property
     def relays(self):
-        return self.network.config.NOSTR_RELAYS.split(',')
+        our_relays = self.config.NOSTR_RELAYS.split(',') if self.config.NOSTR_RELAYS else []
+        if self.sm.is_server:
+            return our_relays
+        last_swapserver_relays = self._last_swapserver_relays or []
+        return list(set(our_relays + last_swapserver_relays))
 
-    def get_offer(self, pubkey):
-        offer = self.offers.get(pubkey)
-        return self._parse_offer(offer)
+    def get_relay_manager(self) -> aionostr.Manager:
+        assert get_running_loop() == get_asyncio_loop(), f"this must be run on the asyncio thread!"
+        if not self.relay_manager:
+            if self.uses_proxy:
+                proxy = make_aiohttp_proxy_connector(self.network.proxy, self.ssl_context)
+            else:
+                proxy: Optional['ProxyConnector'] = None
+            nostr_logger = self.logger.getChild('aionostr')
+            nostr_logger.setLevel('INFO')  # DEBUG is very verbose with aionostr
+            return aionostr.Manager(
+                self.relays,
+                private_key=self.nostr_private_key,
+                log=nostr_logger,
+                ssl_context=self.ssl_context,
+                proxy=proxy,
+                connect_timeout=self.connect_timeout
+            )
+        return self.relay_manager
 
-    def _parse_offer(self, offer):
-        return SwapFees(
-            percentage = offer['percentage_fee'],
-            normal_fee = offer['normal_mining_fee'],
-            lockup_fee = offer['reverse_mining_fee'],
-            claim_fee = offer['claim_mining_fee'],
-            min_amount = offer['min_amount'],
-            max_amount = offer['max_amount'],
-        )
+    def get_offer(self, pubkey: str) -> Optional[SwapOffer]:
+        return self._offers.get(pubkey)
 
+    def get_recent_offers(self) -> Sequence[SwapOffer]:
+        # filter to fresh timestamps
+        now = int(time.time())
+        recent_offers = [x for x in self._offers.values() if now - x.timestamp < 3600]
+        # sort by proof-of-work
+        recent_offers = sorted(recent_offers, key=lambda x: x.pow_bits, reverse=True)
+        # cap list size
+        recent_offers = recent_offers[:20]
+        return recent_offers
+
+    @ignore_exceptions
     @log_exceptions
-    async def publish_offer(self, sm):
+    async def publish_offer(self, sm: 'SwapManager') -> None:
         assert self.sm.is_server
+        if sm._max_forward < sm._min_amount and sm._max_reverse < sm._min_amount:
+            self.logger.warning(f"not publishing swap offer, no liquidity available: {sm._max_forward=}, {sm._max_reverse=}")
+            return
         offer = {
-            "type": "electrum-swap",
-            "version": self.NOSTR_EVENT_VERSION,
-            'network': constants.net.NET_NAME,
             'percentage_fee': sm.percentage,
-            'normal_mining_fee': sm.normal_fee,
-            'reverse_mining_fee': sm.lockup_fee,
-            'claim_mining_fee': sm.claim_fee,
+            'mining_fee': sm.mining_fee,
             'min_amount': sm._min_amount,
-            'max_amount': sm._max_amount,
+            'max_forward_amount': sm._max_forward,
+            'max_reverse_amount': sm._max_reverse,
             'relays': sm.config.NOSTR_RELAYS,
+            'pow_nonce': hex(sm.config.SWAPSERVER_ANN_POW_NONCE),
         }
-        self.logger.info(f'publishing swap offer..')
-        event_id = await aionostr._add_event(
-            self.relay_manager,
-            kind=self.NOSTR_SWAP_OFFER,
-            content=json.dumps(offer),
-            private_key=self.nostr_private_key)
+        # the first value of a single letter tag is indexed and can be filtered for
+        tags = [['d', f'electrum-swapserver-{self.NOSTR_EVENT_VERSION}'],
+                ['r', 'net:' + constants.net.NET_NAME],
+                ['expiration', str(int(time.time() + self.OFFER_UPDATE_INTERVAL_SEC + 10))]]
+        try:
+            event_id = await aionostr._add_event(
+                self.relay_manager,
+                kind=self.USER_STATUS_NIP38,
+                tags=tags,
+                content=json.dumps(offer),
+                private_key=self.nostr_private_key)
+            self.logger.info(f"published offer {event_id}")
+        except asyncio.TimeoutError as e:
+            self.logger.warning(f"failed to publish swap offer: {str(e)}")
 
-    async def send_direct_message(self, pubkey: str, relays, content: str) -> str:
-        event_id = await aionostr._add_event(
-            self.relay_manager,
-            kind=self.NOSTR_DM,
-            content=content,
-            private_key=self.nostr_private_key,
-            direct_message=pubkey)
+    @ignore_exceptions
+    @log_exceptions
+    async def send_direct_message(self, pubkey: str, content: str, *, retries: int = 0) -> Optional[str]:
+        assert retries < 25, "Use a sane retry amount"
+        our_private_key = aionostr.key.PrivateKey(self.private_key)
+        recv_pubkey_hex = aionostr.util.from_nip19(pubkey)['object'].hex() if pubkey.startswith('npub') else pubkey
+        encrypted_msg = our_private_key.encrypt_message(content, recv_pubkey_hex)
+        try:
+            event_id = await aionostr._add_event(
+                self.relay_manager,
+                kind=self.EPHEMERAL_REQUEST,
+                content=encrypted_msg,
+                private_key=self.nostr_private_key,
+                tags=[['p', recv_pubkey_hex]],
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning(f"sending message to {pubkey} failed: timeout. {retries=}")
+            if retries > 0:
+                return await self.send_direct_message(pubkey, content, retries=retries-1)
+            return None
         return event_id
 
     @log_exceptions
-    async def send_request_to_server(self, method: str, request: dict) -> dict:
-        request['method'] = method
-        request['relays'] = self.config.NOSTR_RELAYS
-        server_pubkey = self.config.SWAPSERVER_NPUB
-        event_id = await self.send_direct_message(server_pubkey, self.server_relays, json.dumps(request))
-        response = await self.dm_replies[event_id]
+    async def send_request_to_server(self, method: str, request_data: dict) -> dict:
+        self.logger.debug(f"swapserver req: method: {method} relays: {self.relays}")
+        request_data['method'] = method
+        server_npub = self.config.SWAPSERVER_NPUB
+        server_pubkey = aionostr.util.from_nip19(server_npub)['object'].hex()
+        event_id = await self.send_direct_message(server_pubkey, json.dumps(request_data), retries=1)
+        if not event_id:
+            raise SwapServerError()
+        self.dm_replies[(server_pubkey, event_id)] = fut = asyncio.Future()
+        response = await fut
+        assert isinstance(response, dict)
+        if 'error' in response:
+            self.logger.warning(f"error from swap server [DO NOT TRUST THIS MESSAGE]: {response['error']}")
+            raise SwapServerError()
         return response
 
-    async def receive_offers(self):
+    async def _get_pairs_loop(self):
         await self.is_connected.wait()
-        query = {"kinds": [self.NOSTR_SWAP_OFFER], "limit":10}
+        query = {
+            "kinds": [self.USER_STATUS_NIP38],
+            "limit": 10,
+            "#d": [f"electrum-swapserver-{self.NOSTR_EVENT_VERSION}"],
+            "#r": [f"net:{constants.net.NET_NAME}"],
+            "since": int(time.time()) - 60 * 60,
+            "until": int(time.time()) + 60 * 60,
+        }
         async for event in self.relay_manager.get_events(query, single_event=False, only_stored=False):
             try:
                 content = json.loads(event.content)
+                if not isinstance(content, dict):
+                    raise Exception("malformed content, not dict")
+                tags = {k: v for k, v in event.tags}
             except Exception as e:
+                self.logger.debug(f"failed to parse event: {e}")
                 continue
-            if content.get('version') != self.NOSTR_EVENT_VERSION:
+            if tags.get('d') != f"electrum-swapserver-{self.NOSTR_EVENT_VERSION}":
                 continue
-            if content.get('network') != constants.net.NET_NAME:
+            if tags.get('r') != f"net:{constants.net.NET_NAME}":
+                continue
+            if (event.created_at > int(time.time()) + 60 * 60
+                    or event.created_at < int(time.time()) - 60 * 60):
                 continue
             # check if this is the most recent event for this pubkey
             pubkey = event.pubkey
-            ts = self.offers.get(pubkey, {}).get('timestamp', 0)
-            if event.created_at <= ts:
-                #print('skipping old event', pubkey[0:10], event.id)
+            prev_offer = self._offers.get(to_nip19('npub', pubkey))
+            if prev_offer and event.created_at <= prev_offer.timestamp:
                 continue
-            content['pubkey'] = pubkey
-            content['timestamp'] = event.created_at
-            self.offers[pubkey] = content
-            # mirror event to other relays
-            #await man.add_event(event, check_response=False)
-
-    async def get_pairs(self):
-        if self.config.SWAPSERVER_NPUB is None:
-            return
-        query = {"kinds": [self.NOSTR_SWAP_OFFER], "authors": [self.config.SWAPSERVER_NPUB], "limit":1}
-        async for event in self.relay_manager.get_events(query, single_event=True, only_stored=False):
             try:
-                content = json.loads(event.content)
+                pow_nonce = int(content.get('pow_nonce', "0"), 16)  # type: int
+            except Exception:
+                continue
+            pow_bits = get_nostr_ann_pow_amount(bytes.fromhex(pubkey), pow_nonce)
+            if pow_bits < self.config.SWAPSERVER_POW_TARGET:
+                self.logger.debug(f"too low pow: {pubkey}: pow: {pow_bits} nonce: {pow_nonce}")
+                continue
+            try:
+                server_relays = content['relays'].split(',')
+            except Exception:
+                continue
+            try:
+                pairs = SwapFees(
+                    percentage=content['percentage_fee'],
+                    mining_fee=content['mining_fee'],
+                    min_amount=content['min_amount'],
+                    max_forward=content['max_forward_amount'],
+                    max_reverse=content['max_reverse_amount'],
+                )
+            except Exception:
+                self.logger.debug(f"swap fees couldn't be parsed", exc_info=True)
+                continue
+            offer = SwapOffer(
+                pairs=pairs,
+                relays=server_relays[:10],
+                timestamp=event.created_at,
+                server_pubkey=pubkey,
+                pow_bits=pow_bits,
+            )
+            self._offers[offer.server_npub] = offer
+            if self.config.SWAPSERVER_NPUB == offer.server_npub:
+                self.sm.update_pairs(pairs)
+            trigger_callback('swap_offers_changed', self.get_recent_offers())
+            # mirror event to other relays
+            await self.taskgroup.spawn(self.rebroadcast_event(event, server_relays))
+
+    async def update_relays(self):
+        """
+        Update the relays when update_pairs is called.
+        This ensures we try to connect to the same relays as the ones announced by the swap server.
+        """
+        while True:
+            previous_relays = self._last_swapserver_relays
+            await self.sm.pairs_updated.wait()
+            if (conf_swapserver_offer := self._offers.get(self.config.SWAPSERVER_NPUB)) is None:
+                self.logger.debug(
+                    f"pairs updated but no pair for {self.config.SWAPSERVER_NPUB=} available? {self._offers=}",
+                    stack_info=True,
+                )
+                continue
+            latest_known_relays = conf_swapserver_offer.relays
+            if latest_known_relays != previous_relays:
+                self.logger.debug(f"swapserver relays changed, updating relay list.")
+                # store the latest known relays to a file
+                self._store_last_swapserver_relays(latest_known_relays)
+                # update the relay manager
+                await self.relay_manager.update_relays(self.relays)
+
+    async def rebroadcast_event(self, event: Event, server_relays: Sequence[str]):
+        """If the relays of the origin server are different from our relays we rebroadcast the
+        event to our relays so it gets spread more widely."""
+        if not server_relays:
+            return
+        rebroadcast_relays = [relay for relay in self.relay_manager.relays if
+                              relay.url not in server_relays]
+        for relay in rebroadcast_relays:
+            try:
+                res = await relay.add_event(event, check_response=True)
             except Exception as e:
+                self.logger.debug(f"failed to rebroadcast event to {relay.url}: {e}")
                 continue
-            if content.get('version') != self.NOSTR_EVENT_VERSION:
-                continue
-            if content.get('network') != constants.net.NET_NAME:
-                continue
-            # check if this is the most recent event for this pubkey
-            pubkey = event.pubkey
-            content['pubkey'] = pubkey
-            content['timestamp'] = event.created_at
-            self.logger.info(f'received offer from {age(event.created_at)}')
-            pairs = self._parse_offer(content)
-            self.sm.update_pairs(pairs)
-            self.server_relays = content['relays'].split(',')
+            self.logger.debug(f"rebroadcasted event to {relay.url}: {res}")
 
     @log_exceptions
     async def check_direct_messages(self):
         privkey = aionostr.key.PrivateKey(self.private_key)
-        query = {"kinds": [self.NOSTR_DM], "limit":0, "#p": [self.nostr_pubkey]}
+        query = {"kinds": [self.EPHEMERAL_REQUEST], "limit":0, "#p": [self.nostr_pubkey]}
         async for event in self.relay_manager.get_events(query, single_event=False, only_stored=False):
             try:
                 content = privkey.decrypt_message(event.content, event.pubkey)
                 content = json.loads(content)
+                if not isinstance(content, dict):
+                    raise Exception("malformed content, not dict")
             except Exception:
                 continue
             content['event_id'] = event.id
             content['event_pubkey'] = event.pubkey
-            if 'reply_to' in content:
-                self.dm_replies[content['reply_to']].set_result(content)
+            if not self.sm.is_server and 'reply_to' in content:
+                prev_event_id = content['reply_to']
+                server_pubkey = event.pubkey
+                fut = self.dm_replies.get((server_pubkey, prev_event_id))
+                if fut:
+                    fut.set_result(content)
             elif self.sm.is_server and 'method' in content:
-                await self.handle_request(content)
+                if self._swap_server_requests.full():
+                    self.logger.warning(f"too many swap requests, dropping incoming request: {event.id[:10]}...")
+                    continue
+                await self._swap_server_requests.put(content)
             else:
                 self.logger.info(f'unknown message {content}')
 
     @log_exceptions
-    async def handle_request(self, request):
+    async def _handle_requests(self) -> None:
         assert self.sm.is_server
-        # todo: remember event_id of already processed requests
-        method = request.pop('method')
-        event_id = request.pop('event_id')
-        event_pubkey = request.pop('event_pubkey')
-        print(f'handle_request: id={event_id} {method} {request}')
-        relays = request.pop('relays').split(',')
-        if method == 'addswapinvoice':
-            r = self.sm.server_add_swap_invoice(request)
-        elif method == 'createswap':
-            r = self.sm.server_create_swap(request)
-        elif method == 'createnormalswap':
-            r = self.sm.server_create_normal_swap(request)
-        else:
-            raise Exception(method)
-        r['reply_to'] = event_id
-        self.logger.info(f'sending response id={event_id}')
-        await self.send_direct_message(event_pubkey, relays, json.dumps(r))
+        while True:
+            await asyncio.sleep(5)
+            request = await self._swap_server_requests.get()
+            event_id = request.pop('event_id')
+            event_pubkey = request.pop('event_pubkey')
+            try:
+                method = request.pop('method')
+                self.logger.info(f'handle_request: id={event_id} {method} {request}')
+                if method == 'addswapinvoice':  # client-forward-swap phase2
+                    r = self.sm.server_add_swap_invoice(request)
+                elif method == 'createswap':  # client-reverse-swap
+                    r = self.sm.server_create_swap(request)
+                elif method == 'createnormalswap':  # client-forward-swap phase1
+                    r = self.sm.server_create_normal_swap(request)
+                else:
+                    raise Exception(method)
+                r['reply_to'] = event_id
+                self.logger.debug(f'sending response id={event_id}')
+                await self.taskgroup.spawn(self.send_direct_message(event_pubkey, json.dumps(r), retries=2))
+            except Exception as e:
+                self.logger.exception(f"failed to handle {request=}")
+                error_response = json.dumps({
+                    "error": f"Internal Server Error: {str(type(e))}",
+                    "reply_to": event_id,
+                })
+                await self.taskgroup.spawn(self.send_direct_message(event_pubkey, error_response))
+
+    def _store_last_swapserver_relays(self, relays: Sequence[str]):
+        self._last_swapserver_relays = relays
+        if not self.config.path or not relays:
+            return
+        storage_path = os.path.join(self.config.path, 'recent_swapserver_relays')
+        try:
+            with open(storage_path, 'w', encoding="utf-8") as f:
+                json.dump(relays, f, indent=4, sort_keys=True)  # type: ignore
+        except Exception:
+            self.logger.exception(f"failed to write last swapserver relays to {storage_path}")
+
+    def _load_last_swapserver_relays(self) -> Optional[Sequence[str]]:
+        storage_path = os.path.join(self.config.path, 'recent_swapserver_relays')
+        if not os.path.exists(storage_path):
+            return None
+        try:
+            with open(storage_path, 'r', encoding="utf-8") as f:
+                relays = json.load(f)
+        except Exception:
+            self.logger.exception(f"failed to read last swapserver relays from {storage_path}")
+            return None
+        return relays

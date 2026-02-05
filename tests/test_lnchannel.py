@@ -23,85 +23,86 @@
 # (around commit 42de4400bff5105352d0552155f73589166d162b).
 
 import unittest
+from functools import lru_cache
+from unittest import mock
 import os
 import binascii
 from pprint import pformat
 import logging
+import dataclasses
+import time
+from typing import TYPE_CHECKING
 
 from electrum import bitcoin
 from electrum import lnpeer
 from electrum import lnchannel
 from electrum import lnutil
-from electrum import bip32 as bip32_utils
 from electrum.crypto import privkey_to_pubkey
-from electrum.lnutil import SENT, LOCAL, REMOTE, RECEIVED, UpdateAddHtlc
-from electrum.lnutil import effective_htlc_tx_weight
+from electrum.lnutil import (
+    SENT, LOCAL, REMOTE, RECEIVED, UpdateAddHtlc, LnFeatures, secret_to_pubkey, ChannelType,
+    effective_htlc_tx_weight, LocalConfig, RemoteConfig, OnlyPubkeyKeypair,
+)
 from electrum.logging import console_stderr_handler
-from electrum.lnchannel import ChannelState
+from electrum.lnchannel import ChannelState, Channel
 from electrum.json_db import StoredDict
 from electrum.coinchooser import PRNG
 
 from . import ElectrumTestCase
 
+if TYPE_CHECKING:
+    from .test_lnpeer import MockLNWallet
+
+
 one_bitcoin_in_msat = bitcoin.COIN * 1000
 
 
-def create_channel_state(funding_txid, funding_index, funding_sat, is_initiator,
-                         local_amount, remote_amount, privkeys, other_pubkeys,
-                         seed, cur, nex, other_node_id, l_dust, r_dust, l_csv,
-                         r_csv, anchor_outputs):
-    #assert local_amount > 0
-    #assert remote_amount > 0
+def _convert_to_rconfig_from_lconfig(lconfig: LocalConfig) -> RemoteConfig:
+    """converts Alice's local config to Bob's remote config (neutering private keys, etc)"""
+    ctn = 0
+    pcp_secret = lnutil.get_per_commitment_secret_from_seed(
+        lconfig.per_commitment_secret_seed,
+        lnutil.RevocationStore.START_INDEX - ctn)
+    pcp_point = secret_to_pubkey(int.from_bytes(pcp_secret, 'big'))
+    rconfig = RemoteConfig(
+        payment_basepoint=OnlyPubkeyKeypair(pubkey=lconfig.payment_basepoint.pubkey),
+        multisig_key=OnlyPubkeyKeypair(pubkey=lconfig.multisig_key.pubkey),
+        htlc_basepoint=OnlyPubkeyKeypair(pubkey=lconfig.htlc_basepoint.pubkey),
+        delayed_basepoint=OnlyPubkeyKeypair(pubkey=lconfig.delayed_basepoint.pubkey),
+        revocation_basepoint=OnlyPubkeyKeypair(pubkey=lconfig.revocation_basepoint.pubkey),
+        to_self_delay=lconfig.to_self_delay,
+        dust_limit_sat=lconfig.dust_limit_sat,
+        max_htlc_value_in_flight_msat=lconfig.max_htlc_value_in_flight_msat,
+        max_accepted_htlcs=lconfig.max_accepted_htlcs,
+        initial_msat=lconfig.initial_msat,
+        reserve_sat=lconfig.reserve_sat,
+        htlc_minimum_msat=lconfig.htlc_minimum_msat,
+        upfront_shutdown_script=lconfig.upfront_shutdown_script,
+        announcement_node_sig=lconfig.announcement_node_sig,
+        announcement_bitcoin_sig=lconfig.announcement_bitcoin_sig,
+        next_per_commitment_point=pcp_point,
+        current_per_commitment_point=None,
+    )
+    return rconfig
 
+
+def create_channel_state(
+    *,
+    funding_txid: str,
+    funding_index: int,
+    funding_sat: int,
+    is_initiator: bool,
+    other_node_id: bytes,
+    channel_type: ChannelType,
+    local_config: LocalConfig,
+    remote_config: RemoteConfig,
+):
     channel_id, _ = lnpeer.channel_id_from_funding_tx(funding_txid, funding_index)
-    channel_type = lnutil.ChannelType.OPTION_STATIC_REMOTEKEY
-    if anchor_outputs:
-        channel_type |= lnutil.ChannelType.OPTION_ANCHORS_ZERO_FEE_HTLC_TX
     state = {
             "channel_id":channel_id.hex(),
             "short_channel_id":channel_id[:8],
             "funding_outpoint":lnpeer.Outpoint(funding_txid, funding_index),
-            "remote_config":lnpeer.RemoteConfig(
-                payment_basepoint=other_pubkeys[0],
-                multisig_key=other_pubkeys[1],
-                htlc_basepoint=other_pubkeys[2],
-                delayed_basepoint=other_pubkeys[3],
-                revocation_basepoint=other_pubkeys[4],
-                to_self_delay=r_csv,
-                dust_limit_sat=r_dust,
-                max_htlc_value_in_flight_msat=one_bitcoin_in_msat * 5,
-                max_accepted_htlcs=5,
-                initial_msat=remote_amount,
-                reserve_sat=0,
-                htlc_minimum_msat=1,
-                next_per_commitment_point=nex,
-                current_per_commitment_point=cur,
-                upfront_shutdown_script=b'',
-                announcement_node_sig=b'',
-                announcement_bitcoin_sig=b'',
-            ),
-            "local_config":lnpeer.LocalConfig(
-                channel_seed = None,
-                payment_basepoint=privkeys[0],
-                multisig_key=privkeys[1],
-                htlc_basepoint=privkeys[2],
-                delayed_basepoint=privkeys[3],
-                revocation_basepoint=privkeys[4],
-                to_self_delay=l_csv,
-                dust_limit_sat=l_dust,
-                max_htlc_value_in_flight_msat=one_bitcoin_in_msat * 5,
-                max_accepted_htlcs=5,
-                initial_msat=local_amount,
-                reserve_sat=0,
-                per_commitment_secret_seed=seed,
-                funding_locked_received=True,
-                current_commitment_signature=None,
-                current_htlc_signatures=None,
-                htlc_minimum_msat=1,
-                upfront_shutdown_script=b'',
-                announcement_node_sig=b'',
-                announcement_bitcoin_sig=b'',
-            ),
+            "remote_config": remote_config,
+            "local_config": local_config,
             "constraints":lnpeer.ChannelConstraints(
                 flags=0,
                 capacity=funding_sat,
@@ -117,63 +118,108 @@ def create_channel_state(funding_txid, funding_index, funding_sat, is_initiator,
             'revocation_store': {},
             'channel_type': channel_type,
     }
-    return StoredDict(state, None, [])
+    return StoredDict(state, None)
 
-def bip32(sequence):
-    node = bip32_utils.BIP32Node.from_rootseed(b"9dk", xtype='standard').subkey_at_private_derivation(sequence)
-    k = node.eckey.get_secret_bytes()
-    assert len(k) == 32
-    assert type(k) is bytes
-    return k
 
-def create_test_channels(*, feerate=6000, local_msat=None, remote_msat=None,
-                         alice_name="alice", bob_name="bob",
-                         alice_pubkey=b"\x01"*33, bob_pubkey=b"\x02"*33, random_seed=None,
-                         anchor_outputs=False):
+def create_test_channels(
+    *,
+    alice_lnwallet: 'MockLNWallet',
+    bob_lnwallet: 'MockLNWallet',
+    feerate=6000,
+    local_msat=None,
+    remote_msat=None,
+    random_seed=None,
+    anchor_outputs: bool = False,
+    local_max_inflight=None,
+    remote_max_inflight=None,
+    max_accepted_htlcs=5,
+) -> tuple[Channel, Channel]:
     if random_seed is None:  # needed for deterministic randomness
         random_seed = os.urandom(32)
     random_gen = PRNG(random_seed)
-    funding_txid = binascii.hexlify(random_gen.get_bytes(32)).decode("ascii")
+    alice_name = alice_lnwallet.name
+    bob_name = bob_lnwallet.name
+    alice_pubkey = alice_lnwallet.node_keypair.pubkey
+    bob_pubkey = bob_lnwallet.node_keypair.pubkey
+    funding_txid = random_gen.get_bytes(32).hex()
     funding_index = 0
     funding_sat = ((local_msat + remote_msat) // 1000) if local_msat is not None and remote_msat is not None else (bitcoin.COIN * 10)
-    local_amount = local_msat if local_msat is not None else (funding_sat * 1000 // 2)
-    remote_amount = remote_msat if remote_msat is not None else (funding_sat * 1000 // 2)
-    alice_raw = [bip32("m/" + str(i)) for i in range(5)]
-    bob_raw = [bip32("m/" + str(i)) for i in range(5,11)]
-    alice_privkeys = [lnutil.Keypair(privkey_to_pubkey(x), x) for x in alice_raw]
-    bob_privkeys = [lnutil.Keypair(privkey_to_pubkey(x), x) for x in bob_raw]
-    alice_pubkeys = [lnutil.OnlyPubkeyKeypair(x.pubkey) for x in alice_privkeys]
-    bob_pubkeys = [lnutil.OnlyPubkeyKeypair(x.pubkey) for x in bob_privkeys]
+    local_msat = local_msat if local_msat is not None else (funding_sat * 1000 // 2)
+    remote_msat = remote_msat if remote_msat is not None else (funding_sat * 1000 // 2)
+    local_max_inflight = funding_sat * 1000 if local_max_inflight is None else local_max_inflight
+    remote_max_inflight = funding_sat * 1000 if remote_max_inflight is None else remote_max_inflight
 
-    alice_seed = random_gen.get_bytes(32)
-    bob_seed = random_gen.get_bytes(32)
+    for config in [alice_lnwallet.config, bob_lnwallet.config]:
+        config.LIGHTNING_MAX_FUNDING_SAT = max(config.LIGHTNING_MAX_FUNDING_SAT, funding_sat)
 
-    alice_first = lnutil.secret_to_pubkey(
-        int.from_bytes(lnutil.get_per_commitment_secret_from_seed(
-            alice_seed, lnutil.RevocationStore.START_INDEX), "big"))
-    bob_first = lnutil.secret_to_pubkey(
-        int.from_bytes(lnutil.get_per_commitment_secret_from_seed(
-            bob_seed, lnutil.RevocationStore.START_INDEX), "big"))
+    peer_features = alice_lnwallet.features | LnFeatures.OPTION_SUPPORT_LARGE_CHANNEL_OPT
+    channel_type = ChannelType.OPTION_STATIC_REMOTEKEY
+    if anchor_outputs:
+        channel_type |= ChannelType.OPTION_ANCHORS_ZERO_FEE_HTLC_TX
+    # create alice's local config
+    alice_lconfig = alice_lnwallet.make_local_config_for_new_channel(
+        funding_sat=funding_sat,
+        push_msat=remote_msat,
+        initiator=LOCAL,
+        channel_type=channel_type,
+        multisig_funding_keypair=None,
+        peer_features=peer_features,
+        channel_seed=random_gen.get_bytes(32),
+    )
+    alice_lconfig.funding_locked_received = True
+    alice_lconfig.dust_limit_sat = 200
+    alice_lconfig.to_self_delay = 5
+    alice_lconfig.reserve_sat = 0
+    alice_lconfig.max_accepted_htlcs = max_accepted_htlcs
+    alice_lconfig.max_htlc_value_in_flight_msat = local_max_inflight
+    # create bob's local config
+    bob_lconfig = bob_lnwallet.make_local_config_for_new_channel(
+        funding_sat=funding_sat,
+        push_msat=remote_msat,
+        initiator=REMOTE,
+        channel_type=channel_type,
+        multisig_funding_keypair=None,
+        peer_features=peer_features,
+        channel_seed=random_gen.get_bytes(32),
+    )
+    bob_lconfig.funding_locked_received = True
+    bob_lconfig.dust_limit_sat = 1300
+    bob_lconfig.to_self_delay = 4
+    bob_lconfig.reserve_sat = 0
+    bob_lconfig.max_accepted_htlcs = max_accepted_htlcs
+    bob_lconfig.max_htlc_value_in_flight_msat = remote_max_inflight
 
     alice, bob = (
         lnchannel.Channel(
             create_channel_state(
-                funding_txid, funding_index, funding_sat, True, local_amount,
-                remote_amount, alice_privkeys, bob_pubkeys, alice_seed, None,
-                bob_first, other_node_id=bob_pubkey, l_dust=200, r_dust=1300,
-                l_csv=5, r_csv=4, anchor_outputs=anchor_outputs
+                funding_txid=funding_txid,
+                funding_index=funding_index,
+                funding_sat=funding_sat,
+                is_initiator=True,
+                other_node_id=bob_pubkey,
+                channel_type=channel_type,
+                local_config=alice_lconfig,
+                remote_config=_convert_to_rconfig_from_lconfig(bob_lconfig),
             ),
             name=f"{alice_name}->{bob_name}",
-            initial_feerate=feerate),
+            initial_feerate=feerate,
+            lnworker=alice_lnwallet,
+        ),
         lnchannel.Channel(
             create_channel_state(
-                funding_txid, funding_index, funding_sat, False, remote_amount,
-                local_amount, bob_privkeys, alice_pubkeys, bob_seed, None,
-                alice_first, other_node_id=alice_pubkey, l_dust=1300, r_dust=200,
-                l_csv=4, r_csv=5, anchor_outputs=anchor_outputs
+                funding_txid=funding_txid,
+                funding_index=funding_index,
+                funding_sat=funding_sat,
+                is_initiator=False,
+                other_node_id=alice_pubkey,
+                channel_type=channel_type,
+                local_config=bob_lconfig,
+                remote_config=_convert_to_rconfig_from_lconfig(alice_lconfig),
             ),
             name=f"{bob_name}->{alice_name}",
-            initial_feerate=feerate)
+            initial_feerate=feerate,
+            lnworker=bob_lnwallet,
+        )
     )
 
     alice.hm.log[LOCAL]['ctn'] = 0
@@ -192,11 +238,13 @@ def create_test_channels(*, feerate=6000, local_msat=None, remote_msat=None,
     assert len(a_htlc_sigs) == 0
     assert len(b_htlc_sigs) == 0
 
-    alice.open_with_first_pcp(bob_first, sig_from_bob)
-    bob.open_with_first_pcp(alice_first, sig_from_alice)
+    alice.open_with_first_pcp(alice.config[REMOTE].next_per_commitment_point, sig_from_bob)
+    bob.open_with_first_pcp(bob.config[REMOTE].next_per_commitment_point, sig_from_alice)
 
-    alice_second = lnutil.secret_to_pubkey(int.from_bytes(lnutil.get_per_commitment_secret_from_seed(alice_seed, lnutil.RevocationStore.START_INDEX - 1), "big"))
-    bob_second = lnutil.secret_to_pubkey(int.from_bytes(lnutil.get_per_commitment_secret_from_seed(bob_seed, lnutil.RevocationStore.START_INDEX - 1), "big"))
+    alice_second = lnutil.secret_to_pubkey(int.from_bytes(
+        lnutil.get_per_commitment_secret_from_seed(alice.config[LOCAL].per_commitment_secret_seed, lnutil.RevocationStore.START_INDEX - 1), "big"))
+    bob_second = lnutil.secret_to_pubkey(int.from_bytes(
+        lnutil.get_per_commitment_secret_from_seed(bob.config[LOCAL].per_commitment_secret_seed, lnutil.RevocationStore.START_INDEX - 1), "big"))
 
     # from funding_locked:
     alice.config[REMOTE].next_per_commitment_point = bob_second
@@ -207,19 +255,30 @@ def create_test_channels(*, feerate=6000, local_msat=None, remote_msat=None,
 
     return alice, bob
 
+
 class TestFee(ElectrumTestCase):
     """
     test
     https://github.com/lightningnetwork/lightning-rfc/blob/e0c436bd7a3ed6a028e1cb472908224658a14eca/03-transactions.md#requirements-2
     """
-    def test_fee(self):
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.alice_lnwallet = self.create_mock_lnwallet(name="alice", has_anchors=self.TEST_ANCHOR_CHANNELS)
+        self.bob_lnwallet = self.create_mock_lnwallet(name="bob", has_anchors=self.TEST_ANCHOR_CHANNELS)
+
+    async def test_fee(self):
         alice_channel, bob_channel = create_test_channels(
             feerate=253,
-            local_msat=10000000000,
-            remote_msat=5000000000,
-            anchor_outputs=self.TEST_ANCHOR_CHANNELS)
-        expected_value = 9999056 if self.TEST_ANCHOR_CHANNELS else 9999817
+            local_msat=10_000_000_000,
+            remote_msat=5_000_000_000,
+            anchor_outputs=self.TEST_ANCHOR_CHANNELS,
+            alice_lnwallet=self.alice_lnwallet,
+            bob_lnwallet=self.bob_lnwallet,
+        )
+        expected_value = 9_999_056 if self.TEST_ANCHOR_CHANNELS else 9_999_817
         self.assertIn(expected_value, [x.value for x in alice_channel.get_latest_commitment(LOCAL).outputs()])
+
 
 class TestChannel(ElectrumTestCase):
     maxDiff = 999
@@ -239,40 +298,47 @@ class TestChannel(ElectrumTestCase):
         super().setUpClass()
         console_stderr_handler.setLevel(logging.DEBUG)
 
-    def setUp(self):
-        super().setUp()
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.alice_lnwallet = self.create_mock_lnwallet(name="alice", has_anchors=self.TEST_ANCHOR_CHANNELS)
+        self.bob_lnwallet = self.create_mock_lnwallet(name="bob", has_anchors=self.TEST_ANCHOR_CHANNELS)
+
         # Create a test channel which will be used for the duration of this
         # unittest. The channel will be funded evenly with Alice having 5 BTC,
         # and Bob having 5 BTC.
-        self.alice_channel, self.bob_channel = create_test_channels(anchor_outputs=self.TEST_ANCHOR_CHANNELS)
+        self.alice_channel, self.bob_channel = create_test_channels(
+            anchor_outputs=self.TEST_ANCHOR_CHANNELS, alice_lnwallet=self.alice_lnwallet, bob_lnwallet=self.bob_lnwallet)
 
         self.paymentPreimage = b"\x01" * 32
         paymentHash = bitcoin.sha256(self.paymentPreimage)
-        self.htlc_dict = {
-            'payment_hash': paymentHash,
-            'amount_msat':  one_bitcoin_in_msat,
-            'cltv_abs': 5,
-            'timestamp': 0,
-        }
+        self.htlc = UpdateAddHtlc(
+            payment_hash=paymentHash,
+            amount_msat=one_bitcoin_in_msat,
+            cltv_abs=5,
+            timestamp=0,
+        )
 
         # First Alice adds the outgoing HTLC to her local channel's state
         # update log. Then Alice sends this wire message over to Bob who adds
         # this htlc to his remote state update log.
-        self.aliceHtlcIndex = self.alice_channel.add_htlc(self.htlc_dict).htlc_id
+        self.aliceHtlcIndex = self.alice_channel.add_htlc(self.htlc).htlc_id
         self.assertNotEqual(list(self.alice_channel.hm.htlcs_by_direction(REMOTE, RECEIVED, 1).values()), [])
 
         before = self.bob_channel.balance_minus_outgoing_htlcs(REMOTE)
         beforeLocal = self.bob_channel.balance_minus_outgoing_htlcs(LOCAL)
 
-        self.bobHtlcIndex = self.bob_channel.receive_htlc(self.htlc_dict).htlc_id
+        self.bobHtlcIndex = self.bob_channel.receive_htlc(self.htlc).htlc_id
 
         self.htlc = self.bob_channel.hm.log[REMOTE]['adds'][0]
 
     def test_concurrent_reversed_payment(self):
-        self.htlc_dict['payment_hash'] = bitcoin.sha256(32 * b'\x02')
-        self.htlc_dict['amount_msat'] += 1000
-        self.bob_channel.add_htlc(self.htlc_dict)
-        self.alice_channel.receive_htlc(self.htlc_dict)
+        self.htlc = dataclasses.replace(
+            self.htlc,
+            payment_hash=bitcoin.sha256(32 * b'\x02'),
+            amount_msat=self.htlc.amount_msat + 1000,
+        )
+        self.bob_channel.add_htlc(self.htlc)
+        self.alice_channel.receive_htlc(self.htlc)
 
         self.assertNumberNonAnchorOutputs(2, self.alice_channel.get_latest_commitment(LOCAL))
         self.assertNumberNonAnchorOutputs(3, self.alice_channel.get_next_commitment(LOCAL))
@@ -293,7 +359,7 @@ class TestChannel(ElectrumTestCase):
         self.assertNumberNonAnchorOutputs(2, self.alice_channel.get_latest_commitment(REMOTE))
         self.assertNumberNonAnchorOutputs(4, self.alice_channel.get_next_commitment(REMOTE))
 
-    def test_SimpleAddSettleWorkflow(self):
+    async def test_SimpleAddSettleWorkflow(self):
         alice_channel, bob_channel = self.alice_channel, self.bob_channel
         htlc = self.htlc
 
@@ -552,9 +618,12 @@ class TestChannel(ElectrumTestCase):
         tx6 = str(alice_channel.force_close_tx())
         self.assertNotEqual(tx5, tx6)
 
-        self.htlc_dict['amount_msat'] *= 5
-        bob_index = bob_channel.add_htlc(self.htlc_dict).htlc_id
-        alice_index = alice_channel.receive_htlc(self.htlc_dict).htlc_id
+        self.htlc = dataclasses.replace(
+            self.htlc,
+            amount_msat=self.htlc.amount_msat * 5,
+        )
+        bob_index = bob_channel.add_htlc(self.htlc).htlc_id
+        alice_index = alice_channel.receive_htlc(self.htlc).htlc_id
 
         force_state_transition(bob_channel, alice_channel)
 
@@ -653,30 +722,84 @@ class TestChannel(ElectrumTestCase):
         self.alice_to_bob_fee_update(0)
         force_state_transition(self.alice_channel, self.bob_channel)
 
-        self.htlc_dict['payment_hash'] = bitcoin.sha256(32 * b'\x02')
-        self.alice_channel.add_htlc(self.htlc_dict)
-        self.htlc_dict['payment_hash'] = bitcoin.sha256(32 * b'\x03')
-        self.alice_channel.add_htlc(self.htlc_dict)
+        self.htlc = dataclasses.replace(
+            self.htlc,
+            payment_hash=bitcoin.sha256(32 * b'\x02'),
+        )
+        self.alice_channel.add_htlc(self.htlc)
+        self.htlc = dataclasses.replace(
+            self.htlc,
+            payment_hash=bitcoin.sha256(32 * b'\x03'),
+        )
+        self.alice_channel.add_htlc(self.htlc)
         # now there are three htlcs (one was in setUp)
 
         # Alice now has an available balance of 2 BTC. We'll add a new HTLC of
         # value 2 BTC, which should make Alice's balance negative (since she
         # has to pay a commitment fee).
-        new = dict(self.htlc_dict)
-        new['amount_msat'] *= 2.5
-        new['payment_hash'] = bitcoin.sha256(32 * b'\x04')
+        new = dataclasses.replace(
+            self.htlc,
+            amount_msat=int(self.htlc.amount_msat * 2.5),
+            payment_hash=bitcoin.sha256(32 * b'\x04'),
+        )
         with self.assertRaises(lnutil.PaymentFailure) as cm:
             self.alice_channel.add_htlc(new)
         self.assertIn('Not enough local balance', cm.exception.args[0])
 
+    def test_unfunded_channel_can_be_removed(self):
+        """
+        Test that an incoming channel which stays unfunded longer than
+        lnutil.CHANNEL_OPENING_TIMEOUT_BLOCKS and lnutil.CHANNEL_OPENING_TIMEOUT_SEC
+        can be removed
+        """
+        # set the init_height and init_timestamp
+        self.current_height = 800_000
+        self.bob_channel.storage['init_height'] = self.current_height
+        self.alice_channel.storage['init_height'] = self.current_height
+        self.bob_channel.storage['init_timestamp'] = int(time.time())
+        self.alice_channel.storage['init_timestamp'] = int(time.time())
+
+        mock_lnworker = mock.Mock()
+        mock_blockchain = mock.Mock()
+        mock_lnworker.wallet = mock.Mock()
+        mock_lnworker.wallet.is_up_to_date = lambda: True
+        mock_blockchain.is_tip_stale = lambda: False
+        mock_lnworker.network.blockchain = lambda: mock_blockchain
+        mock_lnworker.network.get_local_height = lambda: self.current_height
+        self.bob_channel.lnworker = mock_lnworker
+        self.alice_channel.lnworker = mock_lnworker
+
+        # test that the non-initiator can remove the channel after timeout
+        self.assertFalse(self.bob_channel.is_initiator())
+        self.bob_channel._state = ChannelState.OPENING
+        self.assertFalse(self.bob_channel.can_be_deleted())
+        self.current_height += lnutil.CHANNEL_OPENING_TIMEOUT_BLOCKS + 1
+        self.assertFalse(self.bob_channel.can_be_deleted())  # needs both block and time based timeout
+        self.bob_channel.storage['init_timestamp'] -= lnutil.CHANNEL_OPENING_TIMEOUT_SEC + 1
+        self.alice_channel.storage['init_timestamp'] -= lnutil.CHANNEL_OPENING_TIMEOUT_SEC + 1
+        self.assertTrue(self.bob_channel.can_be_deleted())  # now both timeouts are reached
+        self.current_height = 800_000  # reset to check if we can delete with just the time based timeout
+        self.assertFalse(self.bob_channel.can_be_deleted())
+
+        # test that the initiator can't remove the channel, even after timeout
+        self.current_height += lnutil.CHANNEL_OPENING_TIMEOUT_BLOCKS + 1
+        self.assertTrue(self.alice_channel.is_initiator())
+        self.alice_channel._state = ChannelState.OPENING
+        self.assertFalse(self.alice_channel.can_be_deleted())
 
 class TestChannelAnchors(TestChannel):
     TEST_ANCHOR_CHANNELS = True
 
 
 class TestAvailableToSpend(ElectrumTestCase):
-    def test_DesyncHTLCs(self):
-        alice_channel, bob_channel = create_test_channels(anchor_outputs=self.TEST_ANCHOR_CHANNELS)
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.alice_lnwallet = self.create_mock_lnwallet(name="alice", has_anchors=self.TEST_ANCHOR_CHANNELS)
+        self.bob_lnwallet = self.create_mock_lnwallet(name="bob", has_anchors=self.TEST_ANCHOR_CHANNELS)
+
+    async def test_DesyncHTLCs(self):
+        alice_channel, bob_channel = create_test_channels(
+            anchor_outputs=self.TEST_ANCHOR_CHANNELS, alice_lnwallet=self.alice_lnwallet, bob_lnwallet=self.bob_lnwallet)
         self.assertEqual(499986152000 if not alice_channel.has_anchors() else 499980692000, alice_channel.available_to_spend(LOCAL))
         self.assertEqual(500000000000, bob_channel.available_to_spend(LOCAL))
 
@@ -721,14 +844,76 @@ class TestAvailableToSpend(ElectrumTestCase):
         self.assertEqual(500000000000, bob_channel.available_to_spend(LOCAL))
         alice_channel.add_htlc(htlc)
 
+    async def test_single_payment(self):
+        alice_channel, bob_channel = create_test_channels(
+            anchor_outputs=self.TEST_ANCHOR_CHANNELS,
+            local_msat=4000000000,
+            remote_msat=4000000000,
+            local_max_inflight=1000000000,
+            remote_max_inflight=2000000000,
+            alice_lnwallet=self.alice_lnwallet,
+            bob_lnwallet=self.bob_lnwallet,
+        )
+
+        # alice can send 20 but bob can only receive 10, because of stricter receiving rules
+        self.assertEqual(2000000000, alice_channel.available_to_spend(LOCAL))
+        self.assertEqual(1000000000, bob_channel.available_to_spend(REMOTE))
+
+        # bob can send 10, alice can receive 10
+        self.assertEqual(1000000000, bob_channel.available_to_spend(LOCAL))
+        self.assertEqual(1000000000, alice_channel.available_to_spend(REMOTE))
+
+        paymentPreimage1 = b"\x01" * 32
+        htlc = UpdateAddHtlc(
+            payment_hash=bitcoin.sha256(paymentPreimage1),
+            amount_msat=1000000000,
+            cltv_abs=5,
+            timestamp=0,
+        )
+        # put 10mBTC inflight a->b
+        alice_idx1 = alice_channel.add_htlc(htlc).htlc_id
+        bob_idx1 = bob_channel.receive_htlc(htlc).htlc_id
+        force_state_transition(alice_channel, bob_channel)
+
+        self.assertEqual(1000000000, alice_channel.available_to_spend(LOCAL))
+        self.assertEqual(0, bob_channel.available_to_spend(REMOTE))
+
+        self.assertEqual(1000000000, bob_channel.available_to_spend(LOCAL))
+        self.assertEqual(1000000000, alice_channel.available_to_spend(REMOTE))
+
+        paymentPreimage2 = b"\x02" * 32
+        htlc2 = UpdateAddHtlc(
+            payment_hash=bitcoin.sha256(paymentPreimage2),
+            amount_msat=1500000000,
+            cltv_abs=5,
+            timestamp=0,
+        )
+        # try to add another 15mBTC HTLC while 15mBTC already inflight
+        with self.assertRaises(lnutil.PaymentFailure):
+            alice_idx2 = alice_channel.add_htlc(htlc2).htlc_id
+
+        # settle htlc 1 to clear inflight
+        bob_channel.settle_htlc(paymentPreimage1, bob_idx1)
+        alice_channel.receive_htlc_settle(paymentPreimage1, alice_idx1)
+        force_state_transition(alice_channel, bob_channel)
+
+        self.assertEqual(2000000000, alice_channel.available_to_spend(LOCAL))
+        self.assertEqual(1000000000, alice_channel.available_to_spend(REMOTE))
+
+        self.assertEqual(1000000000, bob_channel.available_to_spend(LOCAL))
+        self.assertEqual(1000000000, alice_channel.available_to_spend(REMOTE))
+
 
 class TestAvailableToSpendAnchors(TestAvailableToSpend):
     TEST_ANCHOR_CHANNELS = True
 
 
 class TestChanReserve(ElectrumTestCase):
-    def setUp(self):
-        alice_channel, bob_channel = create_test_channels(anchor_outputs=False)
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        alice_lnwallet = self.create_mock_lnwallet(name="alice", has_anchors=self.TEST_ANCHOR_CHANNELS)
+        bob_lnwallet = self.create_mock_lnwallet(name="bob", has_anchors=self.TEST_ANCHOR_CHANNELS)
+        alice_channel, bob_channel = create_test_channels(anchor_outputs=False, alice_lnwallet=alice_lnwallet, bob_lnwallet=bob_lnwallet)
         alice_min_reserve = int(.5 * one_bitcoin_in_msat // 1000)
         # We set Bob's channel reserve to a value that is larger than
         # his current balance in the channel. This will ensure that
@@ -757,14 +942,14 @@ class TestChanReserve(ElectrumTestCase):
         #	Bob:	5.0
         paymentPreimage = b"\x01" * 32
         paymentHash = bitcoin.sha256(paymentPreimage)
-        htlc_dict = {
-            'payment_hash': paymentHash,
-            'amount_msat': int(.5 * one_bitcoin_in_msat),
-            'cltv_abs': 5,
-            'timestamp': 0,
-        }
-        self.alice_channel.add_htlc(htlc_dict)
-        self.bob_channel.receive_htlc(htlc_dict)
+        htlc = UpdateAddHtlc(
+            payment_hash=paymentHash,
+            amount_msat=int(.5 * one_bitcoin_in_msat),
+            cltv_abs=5,
+            timestamp=0,
+        )
+        self.alice_channel.add_htlc(htlc)
+        self.bob_channel.receive_htlc(htlc)
         # Force a state transition, making sure this HTLC is considered valid
         # even though the channel reserves are not met.
         force_state_transition(self.alice_channel, self.bob_channel)
@@ -782,10 +967,10 @@ class TestChanReserve(ElectrumTestCase):
         #	Alice:	4.5
         #	Bob:	5.0
         with self.assertRaises(lnutil.PaymentFailure):
-            htlc_dict['payment_hash'] = bitcoin.sha256(32 * b'\x02')
-            self.bob_channel.add_htlc(htlc_dict)
+            htlc = dataclasses.replace(htlc, payment_hash=bitcoin.sha256(32 * b'\x02'))
+            self.bob_channel.add_htlc(htlc)
         with self.assertRaises(lnutil.RemoteMisbehaving):
-            self.alice_channel.receive_htlc(htlc_dict)
+            self.alice_channel.receive_htlc(htlc)
 
     def part2(self):
         paymentPreimage = b"\x01" * 32
@@ -796,22 +981,22 @@ class TestChanReserve(ElectrumTestCase):
         # Resulting balances:
         #	Alice:	1.5
         #	Bob:	9.5
-        htlc_dict = {
-            'payment_hash': paymentHash,
-            'amount_msat': int(3.5 * one_bitcoin_in_msat),
-            'cltv_abs': 5,
-        }
-        self.alice_channel.add_htlc(htlc_dict)
-        self.bob_channel.receive_htlc(htlc_dict)
+        htlc = UpdateAddHtlc(
+            payment_hash=paymentHash,
+            amount_msat=int(3.5 * one_bitcoin_in_msat),
+            cltv_abs=5,
+        )
+        self.alice_channel.add_htlc(htlc)
+        self.bob_channel.receive_htlc(htlc)
         # Add a second HTLC of 1 BTC. This should fail because it will take
         # Alice's balance all the way down to her channel reserve, but since
         # she is the initiator the additional transaction fee makes her
         # balance dip below.
-        htlc_dict['amount_msat'] = one_bitcoin_in_msat
+        htlc = dataclasses.replace(htlc, amount_msat=one_bitcoin_in_msat)
         with self.assertRaises(lnutil.PaymentFailure):
-            self.alice_channel.add_htlc(htlc_dict)
+            self.alice_channel.add_htlc(htlc)
         with self.assertRaises(lnutil.RemoteMisbehaving):
-            self.bob_channel.receive_htlc(htlc_dict)
+            self.bob_channel.receive_htlc(htlc)
 
     def part3(self):
         # Add a HTLC of 2 BTC to Alice, and the settle it.
@@ -820,14 +1005,14 @@ class TestChanReserve(ElectrumTestCase):
         #	Bob:	7.0
         paymentPreimage = b"\x01" * 32
         paymentHash = bitcoin.sha256(paymentPreimage)
-        htlc_dict = {
-            'payment_hash': paymentHash,
-            'amount_msat': int(2 * one_bitcoin_in_msat),
-            'cltv_abs': 5,
-            'timestamp': 0,
-        }
-        alice_idx = self.alice_channel.add_htlc(htlc_dict).htlc_id
-        bob_idx = self.bob_channel.receive_htlc(htlc_dict).htlc_id
+        htlc = UpdateAddHtlc(
+            payment_hash=paymentHash,
+            amount_msat=int(2 * one_bitcoin_in_msat),
+            cltv_abs=5,
+            timestamp=0,
+        )
+        alice_idx = self.alice_channel.add_htlc(htlc).htlc_id
+        bob_idx = self.bob_channel.receive_htlc(htlc).htlc_id
         force_state_transition(self.alice_channel, self.bob_channel)
         self.check_bals(one_bitcoin_in_msat * 3
                         - self.alice_channel.get_next_fee(LOCAL),
@@ -841,9 +1026,9 @@ class TestChanReserve(ElectrumTestCase):
         # And now let Bob add an HTLC of 1 BTC. This will take Bob's balance
         # all the way down to his channel reserve, but since he is not paying
         # the fee this is okay.
-        htlc_dict['amount_msat'] = one_bitcoin_in_msat
-        self.bob_channel.add_htlc(htlc_dict)
-        self.alice_channel.receive_htlc(htlc_dict)
+        htlc = dataclasses.replace(htlc, amount_msat=one_bitcoin_in_msat)
+        self.bob_channel.add_htlc(htlc)
+        self.alice_channel.receive_htlc(htlc)
         force_state_transition(self.alice_channel, self.bob_channel)
         self.check_bals(one_bitcoin_in_msat * 3 \
                         - self.alice_channel.get_next_fee(LOCAL),
@@ -861,9 +1046,14 @@ class TestChanReserveAnchors(TestChanReserve):
 
 
 class TestDust(ElectrumTestCase):
-    def test_DustLimit(self):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.alice_lnwallet = self.create_mock_lnwallet(name="alice", has_anchors=self.TEST_ANCHOR_CHANNELS)
+        self.bob_lnwallet = self.create_mock_lnwallet(name="bob", has_anchors=self.TEST_ANCHOR_CHANNELS)
+
+    async def test_DustLimit(self):
         """Test that addition of an HTLC below the dust limit changes the balances."""
-        alice_channel, bob_channel = create_test_channels(anchor_outputs=self.TEST_ANCHOR_CHANNELS)
+        alice_channel, bob_channel = create_test_channels(anchor_outputs=self.TEST_ANCHOR_CHANNELS, alice_lnwallet=self.alice_lnwallet, bob_lnwallet=self.bob_lnwallet)
         dust_limit_alice = alice_channel.config[LOCAL].dust_limit_sat
         dust_limit_bob = bob_channel.config[LOCAL].dust_limit_sat
         self.assertLess(dust_limit_alice, dust_limit_bob)
@@ -878,12 +1068,12 @@ class TestDust(ElectrumTestCase):
         # to pay for his htlc success transaction
         below_dust_for_bob = dust_limit_bob - 1
         htlc_amt = below_dust_for_bob + success_weight * (fee_per_kw // 1000)
-        htlc = {
-            'payment_hash': paymentHash,
-            'amount_msat': 1000 * htlc_amt,
-            'cltv_abs': 5,  # consistent with channel policy
-            'timestamp': 0,
-        }
+        htlc = UpdateAddHtlc(
+            payment_hash=paymentHash,
+            amount_msat=1000 * htlc_amt,
+            cltv_abs=5,  # consistent with channel policy
+            timestamp=0,
+        )
 
         # add the htlc
         alice_htlc_id = alice_channel.add_htlc(htlc).htlc_id

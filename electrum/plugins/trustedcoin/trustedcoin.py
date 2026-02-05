@@ -45,6 +45,7 @@ from electrum.plugin import BasePlugin, hook
 from electrum.util import NotEnoughFunds, UserFacingException, error_text_str_to_safe_str
 from electrum.network import Network
 from electrum.logging import Logger
+from electrum.keystore import KeyStore
 
 if TYPE_CHECKING:
     from electrum.wizard import NewWalletWizard
@@ -382,6 +383,15 @@ class Wallet_2fa(Multisig_Wallet):
     def is_billing_address(self, addr: str) -> bool:
         return addr in self._billing_addresses_set
 
+    def can_enable_disable_keystore(self, ks: KeyStore) -> bool:
+        return False
+
+    def enable_keystore(self, keystore, is_hardware_keystore, password):
+        raise Exception("2fa wallet cannot enable keystore")
+
+    def disable_keystore(self, keystore):
+        raise Exception("2fa wallet cannot disable keystore")
+
 
 # Utility functions
 
@@ -586,13 +596,22 @@ class TrustedCoinPlugin(BasePlugin):
                         else 'trustedcoin_have_seed'
             },
             'trustedcoin_create_seed': {
-                'next': 'trustedcoin_confirm_seed'
+                'next': lambda d: 'trustedcoin_create_ext' if wizard.wants_ext(d) else 'trustedcoin_confirm_seed',
+            },
+            'trustedcoin_create_ext': {
+                'next': 'trustedcoin_confirm_seed',
             },
             'trustedcoin_confirm_seed': {
-                'next': 'trustedcoin_tos'
+                'next': lambda d: 'trustedcoin_confirm_ext' if wizard.wants_ext(d) else 'trustedcoin_tos',
+            },
+            'trustedcoin_confirm_ext': {
+                'next': 'trustedcoin_tos',
             },
             'trustedcoin_have_seed': {
-                'next': 'trustedcoin_keep_disable'
+                'next': lambda d: 'trustedcoin_have_ext' if wizard.wants_ext(d) else 'trustedcoin_keep_disable',
+            },
+            'trustedcoin_have_ext': {
+                'next': 'trustedcoin_keep_disable',
             },
             'trustedcoin_keep_disable': {
                 'next': lambda d: 'trustedcoin_tos' if d['trustedcoin_keepordisable'] != 'disable'

@@ -9,7 +9,7 @@ from electrum.keystore import bip39_normalize_passphrase
 from electrum.bip32 import BIP32Node, convert_bip32_strpath_to_intpath as parse_path
 from electrum.logging import Logger
 from electrum.plugin import runs_in_hwd_thread
-from electrum.plugins.hw_wallet.plugin import OutdatedHwFirmwareException, HardwareClientBase
+from electrum.hw_wallet.plugin import OutdatedHwFirmwareException, HardwareClientBase
 
 from trezorlib.client import TrezorClient, PASSPHRASE_ON_DEVICE
 from trezorlib.exceptions import TrezorFailure, Cancelled, OutdatedFirmwareError
@@ -223,6 +223,8 @@ class TrezorClientBase(HardwareClientBase, Logger):
             return "Trezor T"
         elif model == "Safe 3":
             return "Trezor Safe 3"
+        elif model == "Safe 5":
+            return "Trezor Safe 5"
         return None
 
     @runs_in_hwd_thread

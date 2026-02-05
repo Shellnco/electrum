@@ -6,13 +6,12 @@ import os
 import re
 import traceback
 
-from PyQt6 import QtCore
+from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
-from PyQt6 import QtGui
-from PyQt6 import QtWidgets
 
 from electrum import util
 from electrum.i18n import _
+from electrum.base_crash_reporter import taint_reports_by_console_usage
 
 from .util import MONOSPACE_FONT, font_height
 
@@ -85,7 +84,7 @@ class Console(QtWidgets.QPlainTextEdit):
         with open(filename) as f:
             script = f.read()
 
-        self.exec_command(script)
+        self._exec_command(script)
 
     def updateNamespace(self, namespace):
         self.namespace.update(namespace)
@@ -223,14 +222,15 @@ class Console(QtWidgets.QPlainTextEdit):
         command = self.getConstruct(command)
 
         if command:
-            self.exec_command(command)
+            self._exec_command(command)
         self.newPrompt('')
         self.set_json(False)
 
-    def exec_command(self, command):
+    def _exec_command(self, command):
         tmp_stdout = sys.stdout
+        taint_reports_by_console_usage()
 
-        class stdoutProxy():
+        class StdoutProxy:
             def __init__(self, write_func):
                 self.write_func = write_func
                 self.skip = False
@@ -245,12 +245,12 @@ class Console(QtWidgets.QPlainTextEdit):
                     QtCore.QCoreApplication.processEvents()
                 self.skip = not self.skip
 
-        if type(self.namespace.get(command)) == type(lambda:None):
+        if type(self.namespace.get(command)) == type(lambda: None):
             self.appendPlainText("'{}' is a function. Type '{}()' to use it in the Python console."
                                  .format(command, command))
             return
 
-        sys.stdout = stdoutProxy(self.appendPlainText)
+        sys.stdout = StdoutProxy(self.appendPlainText)
         try:
             try:
                 # eval is generally considered bad practice. use it wisely!

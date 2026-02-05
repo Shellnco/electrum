@@ -6,7 +6,6 @@ CONTRIB_ANDROID="$(dirname "$(readlink -e "$0")")"
 CONTRIB="$CONTRIB_ANDROID"/..
 PROJECT_ROOT="$CONTRIB"/..
 PACKAGES="$PROJECT_ROOT"/packages/
-LOCALE="$PROJECT_ROOT"/electrum/locale/
 
 . "$CONTRIB"/build_tools_util.sh
 
@@ -20,17 +19,12 @@ if [ ! -d "$PACKAGES" ]; then
     "$CONTRIB"/make_packages.sh || fail "make_packages failed"
 fi
 
-pushd "$PROJECT_ROOT"
-git submodule update --init
-popd
-
 # update locale
 info "preparing electrum-locale."
 (
-    LOCALE="$PROJECT_ROOT/electrum/locale/"
+    "$CONTRIB/locale/build_cleanlocale.sh"
     # we want the binary to have only compiled (.mo) locale files; not source (.po) files
-    rm -rf "$LOCALE"
-    "$CONTRIB/build_locale.sh" "$CONTRIB/deterministic-build/electrum-locale/locale/" "$LOCALE"
+    rm -r "$PROJECT_ROOT/electrum/locale/locale"/*/electrum.po
 )
 
 pushd "$CONTRIB_ANDROID"
@@ -92,16 +86,22 @@ if [[ "$2" == "all" ]] ; then
     # FIXME failures are not propagated out: we should fail the script if any arch build fails
     export APP_ANDROID_ARCHS=armeabi-v7a
     export APP_ANDROID_NUMERIC_VERSION=$("$CONTRIB_ANDROID"/get_apk_versioncode.py "$APP_ANDROID_ARCHS")
+    "$CONTRIB_ANDROID"/make_barcode_scanner.sh "$APP_ANDROID_ARCHS" || fail "make_barcode_scanner.sh failed"
     make $TARGET
+
     export APP_ANDROID_ARCHS=arm64-v8a
     export APP_ANDROID_NUMERIC_VERSION=$("$CONTRIB_ANDROID"/get_apk_versioncode.py "$APP_ANDROID_ARCHS")
+    "$CONTRIB_ANDROID"/make_barcode_scanner.sh "$APP_ANDROID_ARCHS" || fail "make_barcode_scanner.sh failed"
     make $TARGET
+
     export APP_ANDROID_ARCHS=x86_64
     export APP_ANDROID_NUMERIC_VERSION=$("$CONTRIB_ANDROID"/get_apk_versioncode.py "$APP_ANDROID_ARCHS")
+    "$CONTRIB_ANDROID"/make_barcode_scanner.sh "$APP_ANDROID_ARCHS" || fail "make_barcode_scanner.sh failed"
     make $TARGET
 else
     export APP_ANDROID_ARCHS=$2
     export APP_ANDROID_NUMERIC_VERSION=$("$CONTRIB_ANDROID"/get_apk_versioncode.py "$APP_ANDROID_ARCHS")
+    "$CONTRIB_ANDROID"/make_barcode_scanner.sh "$APP_ANDROID_ARCHS" || fail "make_barcode_scanner.sh failed"
     make $TARGET
 fi
 

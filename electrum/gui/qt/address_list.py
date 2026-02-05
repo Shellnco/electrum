@@ -25,11 +25,11 @@
 
 import enum
 from enum import IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from PyQt6.QtCore import Qt, QPersistentModelIndex, QModelIndex
 from PyQt6.QtGui import QStandardItemModel, QStandardItem, QFont
-from PyQt6.QtWidgets import QAbstractItemView, QComboBox, QLabel, QMenu
+from PyQt6.QtWidgets import QAbstractItemView, QComboBox, QMenu
 
 from electrum.i18n import _
 from electrum.util import block_explorer_URL, profiler
@@ -44,6 +44,7 @@ from ..messages import MSG_FREEZE_ADDRESS
 
 if TYPE_CHECKING:
     from .main_window import ElectrumWindow
+    from electrum.wallet import AddressIndexGeneric
 
 
 class AddressUsageStateFilter(IntEnum):
@@ -219,9 +220,9 @@ class AddressList(MyTreeView):
             else:
                 address_item[self.Columns.TYPE].setText(_('receiving'))
                 address_item[self.Columns.TYPE].setBackground(ColorScheme.GREEN.as_color(True))
-            address_item[0].setData(address, self.ROLE_ADDRESS_STR)
+            address_item[self.Columns.TYPE].setData(address, self.ROLE_ADDRESS_STR)
             address_path = self.wallet.get_address_index(address)
-            address_item[self.Columns.TYPE].setData(address_path, self.ROLE_SORT_ORDER)
+            address_item[self.Columns.TYPE].setData(self.address_index_as_sortable_key(address_path), self.ROLE_SORT_ORDER)
             address_path_str = self.wallet.get_address_path_str(address)
             if address_path_str is not None:
                 address_item[self.Columns.TYPE].setToolTip(address_path_str)
@@ -242,6 +243,15 @@ class AddressList(MyTreeView):
         self.proxy.setDynamicSortFilter(True)
         # update counter
         self.num_addr_label.setText(_("{} addresses").format(num_shown))
+
+    @staticmethod
+    def address_index_as_sortable_key(address_index: Optional['AddressIndexGeneric']) -> str:
+        if isinstance(address_index, str):  # pubkey hex
+            return address_index
+        elif address_index is None:
+            return ""
+        else:
+            return "".join(f"{i:08x}" for i in address_index)
 
     def refresh_row(self, key, row):
         assert row is not None

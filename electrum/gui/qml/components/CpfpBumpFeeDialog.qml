@@ -147,14 +147,14 @@ ElDialog {
                             Layout.fillWidth: true
                             finalizer: dialog.cpfpfeebumper
                             showTxInfo: false
+                            allowPickerFeeRates: false
                         }
                     }
                 }
 
                 InfoTextArea {
                     Layout.columnSpan: 2
-                    Layout.preferredWidth: parent.width * 3/4
-                    Layout.alignment: Qt.AlignHCenter
+                    Layout.fillWidth: true
                     Layout.topMargin: constants.paddingLarge
                     visible: cpfpfeebumper.warning != ''
                     text: cpfpfeebumper.warning
@@ -220,13 +220,6 @@ ElDialog {
             icon.source: '../../icons/confirmed.png'
             enabled: cpfpfeebumper.valid
             onClicked: doAccept()
-        }
-    }
-
-    Connections {
-        target: cpfpfeebumper
-        function onTxMined() {
-            dialog.doReject()
         }
     }
 }

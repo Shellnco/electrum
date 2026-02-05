@@ -3,7 +3,7 @@
 ```
 Licence: MIT Licence
 Author: Thomas Voegtlin
-Language: Python (>= 3.8)
+Language: Python (>= 3.10)
 Homepage: https://electrum.org/
 ```
 
@@ -109,8 +109,8 @@ $ python3 -m pip install --user -e .
 
 Create translations (optional):
 ```
-$ sudo apt-get install python3-requests gettext qttools5-dev-tools
-$ ./contrib/pull_locale
+$ sudo apt-get install gettext
+$ ./contrib/locale/build_locale.sh electrum/locale/locale electrum/locale/locale
 ```
 
 Finally, to start Electrum:
@@ -124,6 +124,7 @@ Run unit tests with `pytest`:
 ```
 $ pytest tests -v
 ```
+(can be parallelized with `-n auto` option, using [`pytest-xdist`](https://github.com/pytest-dev/pytest-xdist) plugin)
 
 To run a single file, specify it directly like this:
 ```
@@ -151,3 +152,5 @@ Besides [GitHub](https://github.com/spesmilo/electrum),
 most communication about Electrum development happens on IRC, in the
 `#electrum` channel on Libera Chat. The easiest way to participate on IRC is
 with the web client, [web.libera.chat](https://web.libera.chat/#electrum).
+
+Please improve translations on [Crowdin](https://crowdin.com/project/electrum).
